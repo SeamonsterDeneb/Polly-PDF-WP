@@ -69,12 +69,25 @@ def _get_parent_tree_xref(doc: fitz.Document) -> int:
 
 
 def _get_document_struct_xref(doc: fitz.Document) -> int:
-    """Find the top-level /Document struct element (direct child of StructTreeRoot)."""
-    struct_root = doc.xref_object(_get_struct_root_xref(doc))
-    m = re.search(r"/K\s+(\d+)\s+0\s+R", struct_root)
-    if m:
-        return int(m.group(1))
-    raise ValueError("Could not find document-level struct element")
+    """
+    Find the element whose /K array we should append new struct elements to.
+    - If StructTreeRoot's /K is a single ref to a /Document element, return that.
+    - If StructTreeRoot's /K is already a flat array (no /Document wrapper),
+      return the StructTreeRoot xref itself so we append directly to it.
+    """
+    struct_root_xref = _get_struct_root_xref(doc)
+    struct_root = doc.xref_object(struct_root_xref)
+
+    # Case 1: single /K ref -> check if it's a /Document element
+    single = re.search(r'/K\s+(\d+)\s+0\s+R', struct_root)
+    if single:
+        candidate_xref = int(single.group(1))
+        candidate = doc.xref_object(candidate_xref)
+        if '/S /Document' in candidate or '/Document' in candidate:
+            return candidate_xref
+
+    # Case 2: /K is already a flat array on the StructTreeRoot itself
+    return struct_root_xref
 
 
 def _get_contents_xref(doc: fitz.Document, page_num: int) -> int:
@@ -94,76 +107,129 @@ def rewrite_content_stream_for_image(
     Find the nth raster image draw sequence on the page and wrap it in a
     /Figure BDC ... EMC block with the given MCID.
 
-    The pattern we target is the innermost save/restore block:
-        \\nq\\n/GS<n> gs\\n<matrix> cm\\n/Im<n> Do\\nQ
-    which InDesign generates for every raster image placement.
+    Handles multiple PDF producer patterns:
+      - InDesign:  \\nq\\n/GS<n> gs\\n<matrix> cm\\n/ImN Do\\nQ
+      - Acrobat:   \\nq\\n<clip> re\\nW n\\nq\\n<matrix> cm\\n/ImN Do\\nQ\\nEMC\\nEMC
+      - Generic:   any \\nq\\n...\\n/ImN Do\\nQ block
     """
     page = doc[page_num]
     content = page.read_contents().decode("latin-1")
 
-    # Match the innermost q.../ImN Do/Q image block
-    img_block_pattern = re.compile(
-        r"\nq\n/GS\d+ gs\n[^\n]+ cm\n/Im\d+ Do\nQ"
-    )
-    matches = list(img_block_pattern.finditer(content))
+    # Find all /ImN Do commands
+    do_matches = list(re.finditer(r'/Im\d+\s+Do', content))
 
-    if img_index >= len(matches):
+    if img_index >= len(do_matches):
         raise IndexError(
             f"imgIdx {img_index} out of range: page {page_num+1} has "
-            f"{len(matches)} raster image(s)"
+            f"{len(do_matches)} raster image(s)"
         )
 
-    match = matches[img_index]
-    old_block = match.group(0)
-    new_block = f"\n/Figure <</MCID {mcid}>>BDC{old_block}\nEMC"
+    do_match = do_matches[img_index]
+    do_pos = do_match.start()
 
-    new_content = content[: match.start()] + new_block + content[match.end() :]
+    # Walk backwards from /ImN Do to find the opening q of the innermost save block
+    pre = content[:do_pos]
+    q_pos = pre.rfind('\nq\n')
+    if q_pos < 0:
+        raise ValueError(f"Could not find opening 'q' before image on page {page_num+1}")
+
+    # Walk forwards from /ImN Do to find the closing Q
+    post = content[do_pos:]
+    q_close = re.search(r'\nQ\n', post)
+    if not q_close:
+        raise ValueError(f"Could not find closing 'Q' after image on page {page_num+1}")
+
+    close_pos = do_pos + q_close.end()  # position right after the \nQ\n
+
+    # Extract the image block: from \nq to end of \nQ\n
+    img_block = content[q_pos:close_pos]
+
+    # Build the replacement: Figure BDC wraps only the innermost q...Q block
+    new_block = f"\n/Figure <</MCID {mcid}>>BDC{img_block}EMC\n"
+
+    new_content = content[:q_pos] + new_block + content[close_pos:]
+
     contents_xref = _get_contents_xref(doc, page_num)
     doc.update_stream(contents_xref, new_content.encode("latin-1"))
     return True
 
 
 def create_figure_struct_element(
-    doc: fitz.Document, page_xref: int, mcid: int, alt_text: str
+    doc: fitz.Document, page_xref: int, mcid: int, alt_text: str, page_num: int, img_index: int
 ) -> int:
     """
-    Allocate a new xref and write a /Figure struct element to it.
+    Allocate a new xref and write a /Figure struct element to it,
+    including a /Layout attribute object with BBox/Width/Height so
+    screen readers can spatially locate the figure.
     Returns the new xref number.
     """
     doc_struct_xref = _get_document_struct_xref(doc)
-    new_xref = doc.get_new_xref()
+
+    # Get image bounding box from fitz
+    try:
+        img_infos = doc[page_num].get_image_info(hashes=False)
+        # Match by index among raster images on this page
+        raster_infos = [i for i in img_infos if i.get('width', 0) > 1]
+        if img_index < len(raster_infos):
+            bbox = raster_infos[img_index]['bbox']  # (x0, y0, x1, y1)
+            width = bbox[2] - bbox[0]
+            height = bbox[3] - bbox[1]
+        else:
+            bbox = (0, 0, 612, 792)
+            width, height = 612, 792
+    except Exception:
+        bbox = (0, 0, 612, 792)
+        width, height = 612, 792
 
     # Escape parentheses in alt text for PDF string syntax
     safe_alt = alt_text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
+    # Create the /A layout attribute object
+    attr_xref = doc.get_new_xref()
+    bbox_xref = doc.get_new_xref()
+
+    bbox_obj = f"[ {bbox[0]:.4f} {bbox[1]:.4f} {bbox[2]:.4f} {bbox[3]:.4f} ]"
+    doc.update_object(bbox_xref, bbox_obj)
+
+    attr_obj = (
+        f"<</O /Layout "
+        f"/BBox {bbox_xref} 0 R "
+        f"/Width {width:.4f} "
+        f"/Height {height:.4f} >>"
+    )
+    doc.update_object(attr_xref, attr_obj)
+
+    # Create the Figure struct element
+    fig_xref = doc.get_new_xref()
     struct_obj = (
         f"<</S /Figure "
         f"/Alt ({safe_alt}\\000) "
         f"/K {mcid} "
+        f"/A {attr_xref} 0 R "
         f"/P {doc_struct_xref} 0 R "
         f"/Pg {page_xref} 0 R "
         f"/T () >>"
     )
-    doc.update_object(new_xref, struct_obj)
-    return new_xref
+    doc.update_object(fig_xref, struct_obj)
+    return fig_xref
 
 
 def append_to_document_struct_k(doc: fitz.Document, new_xref: int) -> None:
-    """Add the new struct element xref to the document-level /K array."""
-    doc_struct_xref = _get_document_struct_xref(doc)
-    doc_struct = doc.xref_object(doc_struct_xref)
+    """Add the new struct element xref to the appropriate /K array."""
+    target_xref = _get_document_struct_xref(doc)
+    target_obj = doc.xref_object(target_xref)
 
     new_ref = f"{new_xref} 0 R"
     updated = re.sub(
         r"(/K\s*\[)([^\]]+)(\])",
         lambda m: m.group(1) + m.group(2) + f"\n      {new_ref} " + m.group(3),
-        doc_struct,
+        target_obj,
     )
 
-    if updated == doc_struct:
-        raise ValueError("Could not update /K array in document struct element")
+    if updated == target_obj:
+        raise ValueError("Could not update /K array in struct element")
 
-    doc.update_object(doc_struct_xref, updated)
+    doc.update_object(target_xref, updated)
 
 
 def update_parent_tree(doc: fitz.Document, mcid: int, struct_xref: int) -> None:
@@ -205,7 +271,7 @@ def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_tex
     page_xref = doc[page_num].xref
 
     rewrite_content_stream_for_image(doc, page_num, img_index, mcid)
-    fig_xref = create_figure_struct_element(doc, page_xref, mcid, alt_text)
+    fig_xref = create_figure_struct_element(doc, page_xref, mcid, alt_text, page_num, img_index)
     append_to_document_struct_k(doc, fig_xref)
     update_parent_tree(doc, mcid, fig_xref)
     increment_parent_tree_next_key(doc, mcid)
