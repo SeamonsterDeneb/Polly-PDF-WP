@@ -43,13 +43,38 @@ def is_tagged(doc: fitz.Document) -> bool:
 
 
 def get_struct_tree_next_key(doc: fitz.Document) -> int:
-    """Read /ParentTreeNextKey from the StructTreeRoot."""
+    """
+    Read /ParentTreeNextKey from the StructTreeRoot.
+    Falls back to computing it from the ParentTree /Nums array when the key
+    is absent (Acrobat- and LibreOffice-generated PDFs omit it).
+    """
     struct_root_xref = _get_struct_root_xref(doc)
     obj = doc.xref_object(struct_root_xref)
+
+    # Fast path: InDesign and well-formed PDFs have this key explicitly
     m = re.search(r"/ParentTreeNextKey\s+(\d+)", obj)
-    if not m:
-        raise ValueError("Could not find /ParentTreeNextKey in StructTreeRoot")
-    return int(m.group(1))
+    if m:
+        return int(m.group(1))
+
+    # Fallback: scan the ParentTree /Nums array for the highest key present
+    # and return max + 1.  Acrobat/LibreOffice leave this implicit.
+    print("🦜 [Polly Core] /ParentTreeNextKey absent — computing from ParentTree /Nums")
+    try:
+        pt_xref = _get_parent_tree_xref(doc)
+        pt_obj = doc.xref_object(pt_xref)
+        # /Nums is a flat array of alternating integer-key / value pairs:
+        # [ 0 ref  1 ref  3 ref ... ]
+        # The integers (keys) are the MCID page-slot indices.
+        keys = [int(k) for k in re.findall(r"(\d+)\s+\d+\s+0\s+R", pt_obj)]
+        if keys:
+            return max(keys) + 1
+        # ParentTree exists but is empty — start at 0
+        return 0
+    except Exception as e:
+        raise ValueError(
+            f"Could not find /ParentTreeNextKey in StructTreeRoot and "
+            f"could not compute it from ParentTree: {e}"
+        )
 
 
 def _get_struct_root_xref(doc: fitz.Document) -> int:
@@ -66,6 +91,47 @@ def _get_parent_tree_xref(doc: fitz.Document) -> int:
     if not m:
         raise ValueError("No /ParentTree found in StructTreeRoot")
     return int(m.group(1))
+
+
+def get_page_structparents(doc: fitz.Document, page_num: int) -> int:
+    page_obj = doc.xref_object(doc[page_num].xref)
+
+    m = re.search(r"/StructParents\s+(\d+)", page_obj)
+    if not m:
+        raise ValueError(
+            f"Page {page_num+1} has no /StructParents entry"
+        )
+
+    return int(m.group(1))
+
+
+def get_parenttree_array_xref(doc: fitz.Document, structparents: int) -> int:
+    pt_xref = _get_parent_tree_xref(doc)
+    pt_obj = doc.xref_object(pt_xref)
+
+    pattern = rf"{structparents}\s+(\d+)\s+0\s+R"
+    m = re.search(pattern, pt_obj)
+
+    if not m:
+        raise ValueError(
+            f"ParentTree slot {structparents} not found"
+        )
+
+    return int(m.group(1))
+
+
+def get_next_page_mcid(doc: fitz.Document, page_num: int) -> int:
+    content = doc[page_num].read_contents().decode("latin-1", errors="ignore")
+
+    mcids = [
+        int(x)
+        for x in re.findall(r"/MCID\s+(\d+)", content)
+    ]
+
+    if not mcids:
+        return 0
+
+    return max(mcids) + 1
 
 
 def _get_document_struct_xref(doc: fitz.Document) -> int:
@@ -91,63 +157,161 @@ def _get_document_struct_xref(doc: fitz.Document) -> int:
 
 
 def _get_contents_xref(doc: fitz.Document, page_num: int) -> int:
-    """Get the xref of the page's content stream."""
+    """
+    Get the xref of the page's content stream, consolidating an array of
+    streams into a single stream first if necessary (common in Acrobat/
+    LibreOffice PDFs).
+    """
     page = doc[page_num]
     obj = doc.xref_object(page.xref)
+
+    # Single stream reference — the easy case
     m = re.search(r"/Contents\s+(\d+)\s+0\s+R", obj)
     if m:
-        return int(m.group(1))
-    raise ValueError(f"Page {page_num+1} has no single /Contents stream (may be array — not yet supported)")
+        candidate = int(m.group(1))
+        try:
+            doc.xref_stream(candidate)   # throws if not a stream
+            return candidate
+        except Exception:
+            pass  # fall through to array handling
+
+    # Array case: /Contents [ 12 0 R  13 0 R ... ]
+    array_m = re.search(r"/Contents\s*\[([^\]]+)\]", obj)
+    if array_m:
+        refs = [int(x) for x in re.findall(r"(\d+)\s+0\s+R", array_m.group(1))]
+        if not refs:
+            raise ValueError(f"Page {page_num+1} has an empty /Contents array")
+
+        if len(refs) == 1:
+            return refs[0]
+
+        print(f"🦜 [Polly Core] Merging {len(refs)} content streams on page {page_num+1}")
+        merged = b""
+        for xref in refs:
+            chunk = doc.xref_stream(xref)
+            if chunk:
+                if merged and not merged.endswith(b"\n"):
+                    merged += b"\n"
+                merged += chunk
+
+        first_xref = refs[0]
+        doc.update_stream(first_xref, merged)
+
+        new_obj = re.sub(
+            r"/Contents\s*\[[^\]]+\]",
+            f"/Contents {first_xref} 0 R",
+            obj,
+        )
+        doc.update_object(page.xref, new_obj)
+
+        return first_xref
+
+    raise ValueError(
+        f"Page {page_num+1} has no recognisable /Contents entry "
+        f"(neither a single ref nor an array)"
+    )
 
 
-def rewrite_content_stream_for_image(
-    doc: fitz.Document, page_num: int, img_index: int, mcid: int
+def rewrite_content_stream_by_name_or_index(
+    doc: fitz.Document, page_num: int, img_index: int, img_name: str, mcid: int
 ) -> bool:
-    """
-    Find the nth raster image draw sequence on the page and wrap it in a
-    /Figure BDC ... EMC block with the given MCID.
+    print(f"🦜 [Polly Core] rewrite_content_stream: page={page_num} imgIdx={img_index} mcid={mcid}")
+    page = doc[page_num]
+    content = page.read_contents().decode("latin-1")
+    print(f"🦜 [Polly Core] content stream length: {len(content)}")
+    print(f"🦜 [Polly Core] Do commands found: {re.findall(r'/\\w+\\s+Do', content)}")
 
-    Handles multiple PDF producer patterns:
-      - InDesign:  \\nq\\n/GS<n> gs\\n<matrix> cm\\n/ImN Do\\nQ
-      - Acrobat:   \\nq\\n<clip> re\\nW n\\nq\\n<matrix> cm\\n/ImN Do\\nQ\\nEMC\\nEMC
-      - Generic:   any \\nq\\n...\\n/ImN Do\\nQ block
+    """
+    Finds the drawing sequence of an image using either its explicit internal resource 
+    dictionary key (e.g. /X0, /Im1, /X9) or a sequential fallback fallback index, 
+    then wraps it safely within a /Figure structural element tag.
     """
     page = doc[page_num]
     content = page.read_contents().decode("latin-1")
 
-    # Find all /ImN Do commands
-    do_matches = list(re.finditer(r'/Im\d+\s+Do', content))
+    # Clean the name entry to handle formatting variations (ensuring it leads with a single slash)
+    clean_name = img_name.strip()
+    if clean_name and not clean_name.startswith("/"):
+        clean_name = "/" + clean_name
 
-    if img_index >= len(do_matches):
-        raise IndexError(
-            f"imgIdx {img_index} out of range: page {page_num+1} has "
-            f"{len(do_matches)} raster image(s)"
-        )
+    # Try matching explicitly by the layout resource name
+    do_pos = -1
+    if clean_name:
+        # Matches patterns like: /X0 Do or /X0  Do
+        name_match = re.search(re.escape(clean_name) + r'\s+Do\b', content)
+        if name_match:
+            do_pos = name_match.start()
 
-    do_match = do_matches[img_index]
-    do_pos = do_match.start()
+    # If matching by resource key fails (typical for older files), fall back to the index engine
+    if do_pos == -1:
+        do_matches = list(re.finditer(r'/\w+\s+Do', content))
+        print(f"🦜 [Polly Core] All Do commands: {[m.group(0) for m in do_matches]}")
+        if img_index < len(do_matches):
+            do_pos = do_matches[img_index].start()
+        else:
+            # Universal global fallback match if index structures vary slightly
+            do_matches_fallback = list(re.finditer(r'/Im\d+\s+Do', content))
+            if img_index < len(do_matches_fallback):
+                do_pos = do_matches_fallback[img_index].start()
 
-    # Walk backwards from /ImN Do to find the opening q of the innermost save block
+    if do_pos == -1:
+        raise ValueError(f"Could not locate image target draw token on page {page_num+1}")
+
     pre = content[:do_pos]
-    q_pos = pre.rfind('\nq\n')
-    if q_pos < 0:
-        raise ValueError(f"Could not find opening 'q' before image on page {page_num+1}")
+    
+    # Locate the outermost wrapping block boundaries
+    bdc_match = None
+    for m in re.finditer(r'/(Artifact|Figure|P|Span)\s*<<[^>]*>>\s*BDC', pre):
+        bdc_match = m
+    
+    if bdc_match is None:
+        q_pos = pre.rfind('\nq\n')
+        if q_pos < 0:
+            q_pos = pre.rfind(' q\n')
+        if q_pos < 0:
+            q_pos = pre.rfind('\nq ')
+        
+        if q_pos < 0:
+            # Strict isolated bounding box wrap fallback
+            new_block = f"\n/Figure <</MCID {mcid}>>BDC\nq\n"
+            # Extract actual targeted draw pattern up to line termination
+            post_line = content[do_pos:]
+            end_line_match = re.search(r'\n', post_line)
+            end_line_pos = do_pos + (end_line_match.end() if end_line_match else len(post_line))
+            
+            target_draw_cmd = content[do_pos:end_line_pos].strip()
+            new_content = content[:do_pos] + f"{target_draw_cmd}\nQ\nEMC\n" + content[end_line_pos:]
+            contents_xref = _get_contents_xref(doc, page_num)
+            doc.update_stream(contents_xref, new_content.encode("latin-1"))
+            return True
 
-    # Walk forwards from /ImN Do to find the closing Q
-    post = content[do_pos:]
-    q_close = re.search(r'\nQ\n', post)
-    if not q_close:
-        raise ValueError(f"Could not find closing 'Q' after image on page {page_num+1}")
-
-    close_pos = do_pos + q_close.end()  # position right after the \nQ\n
-
-    # Extract the image block: from \nq to end of \nQ\n
-    img_block = content[q_pos:close_pos]
-
-    # Build the replacement: Figure BDC wraps only the innermost q...Q block
-    new_block = f"\n/Figure <</MCID {mcid}>>BDC{img_block}EMC\n"
-
-    new_content = content[:q_pos] + new_block + content[close_pos:]
+        post = content[do_pos:]
+        q_close = re.search(r'\nQ\n|\bQ\b', post)
+        if not q_close:
+            raise ValueError(f"Could not find closing 'Q' frame after image on page {page_num+1}")
+        close_pos = do_pos + q_close.end()
+        img_block = content[q_pos:close_pos]
+        new_block = f"\n/Figure <</MCID {mcid}>>BDC\n{img_block.strip()}\nEMC\n"
+        new_content = content[:q_pos] + new_block + content[close_pos:]
+    else:
+        block_start = bdc_match.start()
+        between = content[block_start:do_pos]
+        open_count = len(re.findall(r'\bBDC\b', between))
+        
+        post = content[do_pos:]
+        emc_positions = [m.end() for m in re.finditer(r'\bEMC\b', post)]
+        
+        if open_count > len(emc_positions):
+            open_count = len(emc_positions)
+        
+        close_pos = do_pos + emc_positions[open_count - 1] if emc_positions else do_pos
+        inner = content[block_start:close_pos]
+        
+        inner_q = re.search(r'q\s+.*Do.*\s+Q|q\n.*\nQ', inner, re.DOTALL)
+        drawing = inner_q.group(0) if inner_q else inner
+        
+        new_block = f"\n/Figure <</MCID {mcid}>>BDC\n{drawing.strip()}\nEMC\n"
+        new_content = content[:block_start] + new_block + content[close_pos:]
 
     contents_xref = _get_contents_xref(doc, page_num)
     doc.update_stream(contents_xref, new_content.encode("latin-1"))
@@ -157,21 +321,13 @@ def rewrite_content_stream_for_image(
 def create_figure_struct_element(
     doc: fitz.Document, page_xref: int, mcid: int, alt_text: str, page_num: int, img_index: int
 ) -> int:
-    """
-    Allocate a new xref and write a /Figure struct element to it,
-    including a /Layout attribute object with BBox/Width/Height so
-    screen readers can spatially locate the figure.
-    Returns the new xref number.
-    """
     doc_struct_xref = _get_document_struct_xref(doc)
 
-    # Get image bounding box from fitz
     try:
         img_infos = doc[page_num].get_image_info(hashes=False)
-        # Match by index among raster images on this page
         raster_infos = [i for i in img_infos if i.get('width', 0) > 1]
         if img_index < len(raster_infos):
-            bbox = raster_infos[img_index]['bbox']  # (x0, y0, x1, y1)
+            bbox = raster_infos[img_index]['bbox']
             width = bbox[2] - bbox[0]
             height = bbox[3] - bbox[1]
         else:
@@ -181,25 +337,22 @@ def create_figure_struct_element(
         bbox = (0, 0, 612, 792)
         width, height = 612, 792
 
-    # Escape parentheses in alt text for PDF string syntax
     safe_alt = alt_text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
-    # Create the /A layout attribute object
+    # Inline the BBox array directly — do NOT use a separate xref for it.
+    # PyMuPDF's update_object cannot create a valid indirect array object,
+    # which is what was causing the code=7 crash on save.
+    bbox_inline = f"[ {bbox[0]:.4f} {bbox[1]:.4f} {bbox[2]:.4f} {bbox[3]:.4f} ]"
+
     attr_xref = doc.get_new_xref()
-    bbox_xref = doc.get_new_xref()
-
-    bbox_obj = f"[ {bbox[0]:.4f} {bbox[1]:.4f} {bbox[2]:.4f} {bbox[3]:.4f} ]"
-    doc.update_object(bbox_xref, bbox_obj)
-
     attr_obj = (
         f"<</O /Layout "
-        f"/BBox {bbox_xref} 0 R "
+        f"/BBox {bbox_inline} "
         f"/Width {width:.4f} "
         f"/Height {height:.4f} >>"
     )
     doc.update_object(attr_xref, attr_obj)
 
-    # Create the Figure struct element
     fig_xref = doc.get_new_xref()
     struct_obj = (
         f"<</S /Figure "
@@ -251,18 +404,29 @@ def update_parent_tree(doc: fitz.Document, mcid: int, struct_xref: int) -> None:
 
 
 def increment_parent_tree_next_key(doc: fitz.Document, used_mcid: int) -> None:
-    """Bump /ParentTreeNextKey by 1."""
+    """
+    Bump /ParentTreeNextKey by 1.  If the key was absent (Acrobat/LibreOffice),
+    insert it so subsequent remediations on the same document find it.
+    """
     struct_root_xref = _get_struct_root_xref(doc)
     struct_root = doc.xref_object(struct_root_xref)
-    updated = re.sub(
-        r"/ParentTreeNextKey\s+\d+",
-        f"/ParentTreeNextKey {used_mcid + 1}",
-        struct_root,
-    )
+    new_val = used_mcid + 1
+
+    if "/ParentTreeNextKey" in struct_root:
+        updated = re.sub(
+            r"/ParentTreeNextKey\s+\d+",
+            f"/ParentTreeNextKey {new_val}",
+            struct_root,
+        )
+    else:
+        # Insert the key before the closing >>
+        updated = struct_root.rstrip().rstrip(">").rstrip() + \
+                  f"\n  /ParentTreeNextKey {new_val}\n>>"
+
     doc.update_object(struct_root_xref, updated)
 
 
-def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_text: str) -> str:
+def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_text: str, img_name: str = "") -> str:
     """
     Full tagged-PDF remediation pipeline for one image.
     Returns a status string for logging.
@@ -270,7 +434,7 @@ def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_tex
     mcid = get_struct_tree_next_key(doc)
     page_xref = doc[page_num].xref
 
-    rewrite_content_stream_for_image(doc, page_num, img_index, mcid)
+    rewrite_content_stream_by_name_or_index(doc, page_num, img_index, img_name, mcid)
     fig_xref = create_figure_struct_element(doc, page_xref, mcid, alt_text, page_num, img_index)
     append_to_document_struct_k(doc, fig_xref)
     update_parent_tree(doc, mcid, fig_xref)
@@ -284,8 +448,8 @@ def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_tex
 
 def inject_alt_untagged(doc: fitz.Document, page_num: int, img_index: int, alt_text: str) -> str:
     """
-    Fallback for untagged PDFs: write /Alt onto the image XObject dict.
-    Does NOT touch the pixel data stream, only the dictionary envelope.
+    Fallback for untagged PDFs or Acrobat structures: write /Alt onto the image 
+    XObject dict and refresh content layout to update VoiceOver trees.
     """
     page = doc[page_num]
     images = page.get_images(full=True)
@@ -297,16 +461,35 @@ def inject_alt_untagged(doc: fitz.Document, page_num: int, img_index: int, alt_t
         )
 
     img_xref = images[img_index][0]
-    img_obj = doc.xref_object(img_xref)
-
+    
+    # Escape parentheses safely for PDF literal text format layout
     safe_alt = alt_text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
-    if "/Alt" in img_obj:
-        updated = re.sub(r"/Alt\s*\([^)]*\)", f"/Alt ({safe_alt})", img_obj)
+    # Retrieve the clean internal dictionary object text string
+    img_dict = doc.xref_object(img_xref)
+    
+    # Ensure any trailing garbage spaces or newlines don't clip the closing block identifier
+    stripped_dict = img_dict.strip()
+    
+    # Clear out any legacy broken or blank /Alt tokens cleanly
+    if "/Alt" in stripped_dict:
+        updated = re.sub(r"/Alt\s*\([^)]*\)", f"/Alt ({safe_alt})", stripped_dict)
     else:
-        updated = img_obj.rstrip(">").rstrip() + f"\n  /Alt ({safe_alt})\n>>"
+        # Explicit block append right before the terminal PDF dictionary delimiter symbols
+        if stripped_dict.endswith(">>"):
+            updated = stripped_dict[:-2] + f"\n  /Alt ({safe_alt})\n>>"
+        else:
+            updated = stripped_dict + f"\n  /Alt ({safe_alt})"
 
+    # Write the object modifications back down to the core layout registry stream
     doc.update_object(img_xref, updated)
+    
+    # CRITICAL ACROBAT FORCE REFRESH: Safely trigger a page stream clean to sync assistive trees
+    if hasattr(page, "clean_contents"):
+        page.clean_contents()
+    else:
+        page.get_contents()
+    
     return f"Untagged fallback: page {page_num+1}, imgIdx {img_index}, xref {img_xref}"
 
 
@@ -341,6 +524,7 @@ def remediate_pdf():
         for asset_id, data in remediation_map.items():
             page_num = int(data.get("pageIdx", 0))
             img_index = int(data.get("imgIdx", 0))
+            img_name = data.get("imgName", "").strip()  # Universal Phase 3 fallback
             alt_text = data.get("alt", "").strip()
 
             if not alt_text:
@@ -353,7 +537,7 @@ def remediate_pdf():
 
             try:
                 if tagged:
-                    status = inject_alt_tagged(doc, page_num, img_index, alt_text)
+                    status = inject_alt_tagged(doc, page_num, img_index, alt_text, img_name)
                 else:
                     status = inject_alt_untagged(doc, page_num, img_index, alt_text)
 
@@ -369,6 +553,7 @@ def remediate_pdf():
             return jsonify({"error": "All remediations failed", "details": errors}), 422
 
         # --- Compile output ---
+        print(f"🦜 [Polly Core] Attempting save...")
         output_buffer = io.BytesIO()
         doc.save(output_buffer, garbage=3, deflate=True)
         doc.close()
@@ -393,15 +578,6 @@ def inspect_pdf():
     """
     Helper endpoint: given a PDF, return the list of raster images per page
     so the WordPress frontend can map PDF.js canvas tokens to (pageIdx, imgIdx) pairs.
-
-    Returns JSON:
-    {
-      "tagged": true,
-      "pages": {
-        "0": [{ "imgIdx": 0, "xref": 363, "width": 2560, "height": 1853 }],
-        ...
-      }
-    }
     """
     try:
         if "pdf" not in request.files:

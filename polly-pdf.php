@@ -1,6 +1,6 @@
 <?php
 /**
- * Plugin Name: Polly PDF & Fido Core
+ * Plugin Name: Polly PDF
  * Description: Powered by SeaMonster Studios. Extracts images from uploads and performs serverless structural PDF/UA alt-tagging.
  * Version: 0.2.0
  * Author: SeaMonster Studios
