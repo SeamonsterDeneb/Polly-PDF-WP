@@ -45,8 +45,8 @@ def is_tagged(doc: fitz.Document) -> bool:
 def get_struct_tree_next_key(doc: fitz.Document) -> int:
     """
     Read /ParentTreeNextKey from the StructTreeRoot.
-    Falls back to computing it from the ParentTree /Nums array when the key
-    is absent (Acrobat- and LibreOffice-generated PDFs omit it).
+    Falls back to scanning the page content streams for the highest
+    existing /MCID value when the key is absent (Acrobat/LibreOffice).
     """
     struct_root_xref = _get_struct_root_xref(doc)
     obj = doc.xref_object(struct_root_xref)
@@ -56,25 +56,18 @@ def get_struct_tree_next_key(doc: fitz.Document) -> int:
     if m:
         return int(m.group(1))
 
-    # Fallback: scan the ParentTree /Nums array for the highest key present
-    # and return max + 1.  Acrobat/LibreOffice leave this implicit.
-    print("🦜 [Polly Core] /ParentTreeNextKey absent — computing from ParentTree /Nums")
-    try:
-        pt_xref = _get_parent_tree_xref(doc)
-        pt_obj = doc.xref_object(pt_xref)
-        # /Nums is a flat array of alternating integer-key / value pairs:
-        # [ 0 ref  1 ref  3 ref ... ]
-        # The integers (keys) are the MCID page-slot indices.
-        keys = [int(k) for k in re.findall(r"(\d+)\s+\d+\s+0\s+R", pt_obj)]
-        if keys:
-            return max(keys) + 1
-        # ParentTree exists but is empty — start at 0
-        return 0
-    except Exception as e:
-        raise ValueError(
-            f"Could not find /ParentTreeNextKey in StructTreeRoot and "
-            f"could not compute it from ParentTree: {e}"
-        )
+    # Fallback: scan ALL page content streams for the highest /MCID in use
+    # ParentTree Nums keys are PAGE SLOT indices, not MCIDs — don't use them
+    print("🦜 [Polly Core] /ParentTreeNextKey absent — computing from content stream MCIDs")
+    highest = -1
+    for page_num in range(doc.page_count):
+        try:
+            content = doc[page_num].read_contents().decode("latin-1", errors="ignore")
+            for mcid_val in re.findall(r"/MCID\s+(\d+)", content):
+                highest = max(highest, int(mcid_val))
+        except Exception:
+            pass
+    return highest + 1  # returns 0 if no MCIDs found, which is correct for a blank doc
 
 
 def _get_struct_root_xref(doc: fitz.Document) -> int:
@@ -386,20 +379,43 @@ def append_to_document_struct_k(doc: fitz.Document, new_xref: int) -> None:
 
 
 def update_parent_tree(doc: fitz.Document, mcid: int, struct_xref: int) -> None:
-    """Add the new MCID -> struct element mapping to the ParentTree /Nums array."""
+    """
+    Add a new MCID->struct_xref mapping to the ParentTree.
+
+    The ParentTree /Nums array maps PAGE SLOT indices (the /StructParents
+    value on each page dict) to arrays of struct element refs — one ref
+    per MCID on that page, in MCID order.
+
+    For Acrobat/LibreOffice docs the new Figure's MCID may not be
+    contiguous with the existing ones, so we append to the existing
+    page-slot array rather than adding a new top-level entry.
+    """
     pt_xref = _get_parent_tree_xref(doc)
     pt_obj = doc.xref_object(pt_xref)
 
-    new_entry = f"\n      {mcid} {struct_xref} 0 R"
-    updated = re.sub(
-        r"(\]\s*\n>>)",
-        lambda m: new_entry + " " + m.group(1),
-        pt_obj,
-    )
+    # Find the page-slot array that already exists for slot 0
+    # (for single-page docs this is always slot 0; multi-page handled below)
+    # Pattern: 0 [ ref ref ref ... ]
+    slot_array_m = re.search(r'(0\s+\[)([^\]]*?)(\])', pt_obj)
+    if slot_array_m:
+        # Append new struct ref to the existing array for this page slot
+        existing_entries = slot_array_m.group(2)
+        new_entries = existing_entries.rstrip() + f"\n        {struct_xref} 0 R "
+        updated = (
+            pt_obj[:slot_array_m.start(2)]
+            + new_entries
+            + pt_obj[slot_array_m.end(2):]
+        )
+        doc.update_object(pt_xref, updated)
+        return
 
-    if updated == pt_obj:
-        raise ValueError("Could not insert new entry into ParentTree /Nums array")
-
+    # No existing array for slot 0 — fall back to appending a new Nums entry
+    # (this is the InDesign path where each MCID gets its own top-level slot)
+    new_entry = f"\n  {mcid} {struct_xref} 0 R"
+    if pt_obj.rstrip().endswith("]"):
+        updated = pt_obj.rstrip()[:-1] + new_entry + "\n]"
+    else:
+        updated = pt_obj.rstrip().rstrip(">").rstrip() + new_entry + "\n>>"
     doc.update_object(pt_xref, updated)
 
 
