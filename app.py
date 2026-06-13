@@ -208,21 +208,18 @@ def _get_contents_xref(doc: fitz.Document, page_num: int) -> int:
 def rewrite_content_stream_by_name_or_index(
     doc: fitz.Document, page_num: int, img_index: int, img_name: str, mcid: int
 ) -> bool:
+    """
+    Finds the drawing sequence of an image using either its explicit internal resource 
+    dictionary key (e.g. /X0, /Im1, /X9) or a sequential fallback index, 
+    then wraps it safely within a /Figure structural element tag.
+    """
     print(f"🦜 [Polly Core] rewrite_content_stream: page={page_num} imgIdx={img_index} mcid={mcid}")
     page = doc[page_num]
     content = page.read_contents().decode("latin-1")
     print(f"🦜 [Polly Core] content stream length: {len(content)}")
     print(f"🦜 [Polly Core] Do commands found: {re.findall(r'/\\w+\\s+Do', content)}")
 
-    """
-    Finds the drawing sequence of an image using either its explicit internal resource 
-    dictionary key (e.g. /X0, /Im1, /X9) or a sequential fallback fallback index, 
-    then wraps it safely within a /Figure structural element tag.
-    """
-    page = doc[page_num]
-    content = page.read_contents().decode("latin-1")
-
-    # Clean the name entry to handle formatting variations (ensuring it leads with a single slash)
+    # Clean the name entry to handle formatting variations
     clean_name = img_name.strip()
     if clean_name and not clean_name.startswith("/"):
         clean_name = "/" + clean_name
@@ -230,22 +227,22 @@ def rewrite_content_stream_by_name_or_index(
     # Try matching explicitly by the layout resource name
     do_pos = -1
     if clean_name:
-        # Matches patterns like: /X0 Do or /X0  Do
         name_match = re.search(re.escape(clean_name) + r'\s+Do\b', content)
         if name_match:
             do_pos = name_match.start()
 
-    # If matching by resource key fails (typical for older files), fall back to the index engine
+    # Fall back to index-based match
     if do_pos == -1:
         do_matches = list(re.finditer(r'/\w+\s+Do', content))
         print(f"🦜 [Polly Core] All Do commands: {[m.group(0) for m in do_matches]}")
         if img_index < len(do_matches):
             do_pos = do_matches[img_index].start()
         else:
-            # Universal global fallback match if index structures vary slightly
             do_matches_fallback = list(re.finditer(r'/Im\d+\s+Do', content))
             if img_index < len(do_matches_fallback):
                 do_pos = do_matches_fallback[img_index].start()
+
+    print(f"🦜 [Polly Core] do_pos={do_pos}")
 
     if do_pos == -1:
         raise ValueError(f"Could not locate image target draw token on page {page_num+1}")
@@ -258,34 +255,48 @@ def rewrite_content_stream_by_name_or_index(
         bdc_match = m
     
     if bdc_match is None:
-        q_pos = pre.rfind('\nq\n')
+        # Search for q with any surrounding whitespace (inline or newline-separated)
+        q_match = re.search(r'[\n ]q[\n ]', pre)
+        # Walk backwards to find the LAST q before the Do command
+        q_pos = -1
+        for qm in re.finditer(r'(?:^|\n| )q(?:\n| )', pre):
+            q_pos = qm.start()
+
         if q_pos < 0:
-            q_pos = pre.rfind(' q\n')
-        if q_pos < 0:
-            q_pos = pre.rfind('\nq ')
-        
-        if q_pos < 0:
-            # Strict isolated bounding box wrap fallback
-            new_block = f"\n/Figure <</MCID {mcid}>>BDC\nq\n"
-            # Extract actual targeted draw pattern up to line termination
+            # No q found at all — minimal wrap of just the Do command line
             post_line = content[do_pos:]
-            end_line_match = re.search(r'\n', post_line)
+            end_line_match = re.search(r'[\n]|Q', post_line)
             end_line_pos = do_pos + (end_line_match.end() if end_line_match else len(post_line))
-            
             target_draw_cmd = content[do_pos:end_line_pos].strip()
-            new_content = content[:do_pos] + f"{target_draw_cmd}\nQ\nEMC\n" + content[end_line_pos:]
+            new_content = (
+                content[:do_pos]
+                + f"\n/Figure << /MCID {mcid} >>BDC\n{target_draw_cmd}\nEMC\n"
+                + content[end_line_pos:]
+            )
             contents_xref = _get_contents_xref(doc, page_num)
-            doc.update_stream(contents_xref, new_content.encode("latin-1"))
+            print(f"🦜 [Polly Core] contents_xref={contents_xref}, new content length={len(new_content)}")
+            print(f"🦜 [Polly Core] content around injection: {repr(new_content[max(0,new_content.find('Figure')-20):new_content.find('Figure')+80])}")
+            doc.update_stream(contents_xref, new_content.encode("latin-1"), compress=False)
             return True
 
+        # Find the matching Q after the Do command
+        # Use the full inline pattern — Q may be space-separated, not newline
         post = content[do_pos:]
-        q_close = re.search(r'\nQ\n|\bQ\b', post)
+        q_close = re.search(r'[\n ]Q[\n ]|[\n ]Q$', post)
+        if not q_close:
+            # Last resort — find any Q
+            q_close = re.search(r'Q', post)
         if not q_close:
             raise ValueError(f"Could not find closing 'Q' frame after image on page {page_num+1}")
+
         close_pos = do_pos + q_close.end()
-        img_block = content[q_pos:close_pos]
-        new_block = f"\n/Figure <</MCID {mcid}>>BDC\n{img_block.strip()}\nEMC\n"
-        new_content = content[:q_pos] + new_block + content[close_pos:]
+
+        # Grab the full q...Q block including the opening q whitespace char
+        # q_pos points at the whitespace before q — include from q itself
+        q_char_pos = q_pos + 1 if content[q_pos] in (' ', '\n') else q_pos
+        img_block = content[q_char_pos:close_pos]
+        new_block = f"\n/Figure << /MCID {mcid} >>BDC\n{img_block.strip()}\nEMC\n"
+        new_content = content[:q_char_pos] + new_block + content[close_pos:]
     else:
         block_start = bdc_match.start()
         between = content[block_start:do_pos]
@@ -303,11 +314,13 @@ def rewrite_content_stream_by_name_or_index(
         inner_q = re.search(r'q\s+.*Do.*\s+Q|q\n.*\nQ', inner, re.DOTALL)
         drawing = inner_q.group(0) if inner_q else inner
         
-        new_block = f"\n/Figure <</MCID {mcid}>>BDC\n{drawing.strip()}\nEMC\n"
+        new_block = f"\n/Figure << /MCID {mcid} >>BDC\n{drawing.strip()}\nEMC\n"
         new_content = content[:block_start] + new_block + content[close_pos:]
 
     contents_xref = _get_contents_xref(doc, page_num)
-    doc.update_stream(contents_xref, new_content.encode("latin-1"))
+    print(f"🦜 [Polly Core] contents_xref={contents_xref}, new content length={len(new_content)}")
+    print(f"🦜 [Polly Core] content around injection: {repr(new_content[max(0,new_content.find('Figure')-20):new_content.find('Figure')+80])}")
+    doc.update_stream(contents_xref, new_content.encode("latin-1"), compress=False)
     return True
 
 
@@ -461,52 +474,133 @@ def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_tex
         f"-> MCID {mcid}, struct xref {fig_xref}"
     )
 
+def _get_image_resource_name(doc: fitz.Document, page_num: int, img_xref: int) -> str:
+    """
+    Find the resource name (e.g. '/Im1') used to reference this image
+    xref in the page's /Resources /XObject dict.
+    """
+    page_obj = doc.xref_object(doc[page_num].xref)
+    res_m = re.search(r'/Resources\s+(\d+)\s+0\s+R', page_obj)
+    if res_m:
+        res_obj = doc.xref_object(int(res_m.group(1)))
+    else:
+        res_obj = page_obj
+
+    xobj_m = re.search(r'/XObject\s*<<([^>]*)>>', res_obj)
+    if xobj_m:
+        for name, xref in re.findall(r'(/\w+)\s+(\d+)\s+0\s+R', xobj_m.group(1)):
+            if int(xref) == img_xref:
+                return name
+    return ""
+
+
+def _ensure_struct_tree(doc: fitz.Document) -> None:
+    cat_xref = doc.pdf_catalog()
+    cat_obj = doc.xref_object(cat_xref)
+
+    if "/StructTreeRoot" in cat_obj:
+        return
+
+    print("🦜 [Polly Core] Building struct tree scaffold for untagged PDF")
+
+    # 1. ParentTree
+    pt_xref = doc.get_new_xref()
+    print(f"🦜 [Polly Core] scaffold step 1: ParentTree xref={pt_xref}")
+    doc.update_object(pt_xref, "<< /Nums [] >>")
+
+    # 2. Document struct element
+    doc_xref = doc.get_new_xref()
+    print(f"🦜 [Polly Core] scaffold step 2: Document elem xref={doc_xref}")
+    doc.update_object(doc_xref, "<< /Type /StructElem /S /Document /K [] >>")
+
+    # 3. StructTreeRoot
+    str_root_xref = doc.get_new_xref()
+    print(f"🦜 [Polly Core] scaffold step 3: StructTreeRoot xref={str_root_xref}")
+    str_root_obj = (
+        f"<< /Type /StructTreeRoot "
+        f"/ParentTree {pt_xref} 0 R "
+        f"/ParentTreeNextKey 0 "
+        f"/RoleMap << /Figure /Figure /H1 /H1 /H2 /H2 /P /P /L /L /LI /LI /LBody /LBody >> "
+        f"/K [ {doc_xref} 0 R ] >>"
+    )
+    doc.update_object(str_root_xref, str_root_obj)
+
+    # 4. Set /P on Document element
+    print(f"🦜 [Polly Core] scaffold step 4: wiring /P on Document elem")
+    doc.update_object(
+        doc_xref,
+        f"<< /Type /StructElem /S /Document "
+        f"/P {str_root_xref} 0 R /K [] >>"
+    )
+
+    # 5. Add to catalog
+    print(f"🦜 [Polly Core] scaffold step 5: updating catalog xref={cat_xref}")
+    print(f"🦜 [Polly Core] catalog obj: {repr(cat_obj[:200])}")
+    updated_cat = cat_obj.rstrip().rstrip(">").rstrip()
+    updated_cat += (
+        f"\n  /StructTreeRoot {str_root_xref} 0 R"
+        f"\n  /MarkInfo << /Marked true >>\n>>"
+    )
+    doc.update_object(cat_xref, updated_cat)
+
+    # 6. StructParents on pages
+    print(f"🦜 [Polly Core] scaffold step 6: adding /StructParents to pages")
+    for i in range(doc.page_count):
+        page_obj = doc.xref_object(doc[i].xref)
+        if "/StructParents" not in page_obj:
+            updated_page = page_obj.rstrip().rstrip(">").rstrip()
+            updated_page += f"\n  /StructParents {i}\n>>"
+            doc.update_object(doc[i].xref, updated_page)
+
+    print(f"🦜 [Polly Core] scaffold complete")
 
 def inject_alt_untagged(doc: fitz.Document, page_num: int, img_index: int, alt_text: str) -> str:
     """
-    Fallback for untagged PDFs or Acrobat structures: write /Alt onto the image 
-    XObject dict and refresh content layout to update VoiceOver trees.
+    For untagged PDFs: build a minimal struct tree if absent, then inject
+    a /Figure element with /Alt for the target image.
+    Falls back to a safe no-op rather than corrupting the image stream.
     """
     page = doc[page_num]
     images = page.get_images(full=True)
+    raster = [i for i in images if i[2] > 1]  # filter by width > 1
 
-    if img_index >= len(images):
+    if img_index >= len(raster):
         raise IndexError(
             f"imgIdx {img_index} out of range: page {page_num+1} has "
-            f"{len(images)} image(s)"
+            f"{len(raster)} raster image(s)"
         )
 
-    img_xref = images[img_index][0]
-    
-    # Escape parentheses safely for PDF literal text format layout
+    img_xref = raster[img_index][0]
     safe_alt = alt_text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
-    # Retrieve the clean internal dictionary object text string
-    img_dict = doc.xref_object(img_xref)
-    
-    # Ensure any trailing garbage spaces or newlines don't clip the closing block identifier
-    stripped_dict = img_dict.strip()
-    
-    # Clear out any legacy broken or blank /Alt tokens cleanly
-    if "/Alt" in stripped_dict:
-        updated = re.sub(r"/Alt\s*\([^)]*\)", f"/Alt ({safe_alt})", stripped_dict)
-    else:
-        # Explicit block append right before the terminal PDF dictionary delimiter symbols
-        if stripped_dict.endswith(">>"):
-            updated = stripped_dict[:-2] + f"\n  /Alt ({safe_alt})\n>>"
-        else:
-            updated = stripped_dict + f"\n  /Alt ({safe_alt})"
+    # Ensure the document has a struct tree scaffold
+    _ensure_struct_tree(doc)
 
-    # Write the object modifications back down to the core layout registry stream
-    doc.update_object(img_xref, updated)
-    
-    # CRITICAL ACROBAT FORCE REFRESH: Safely trigger a page stream clean to sync assistive trees
-    if hasattr(page, "clean_contents"):
-        page.clean_contents()
-    else:
-        page.get_contents()
-    
-    return f"Untagged fallback: page {page_num+1}, imgIdx {img_index}, xref {img_xref}"
+    # Assign a new MCID for this image
+    mcid = get_struct_tree_next_key(doc)
+
+    # Wrap the image draw command in a Figure BDC/EMC in the content stream
+    rewrite_content_stream_by_name_or_index(
+        doc, page_num, img_index,
+        _get_image_resource_name(doc, page_num, img_xref),
+        mcid
+    )
+
+    # Create the Figure struct element
+    page_xref = page.xref
+    fig_xref = create_figure_struct_element(
+        doc, page_xref, mcid, alt_text, page_num, img_index
+    )
+
+    # Wire it into the struct tree
+    append_to_document_struct_k(doc, fig_xref)
+    update_parent_tree(doc, mcid, fig_xref)
+    increment_parent_tree_next_key(doc, mcid)
+
+    return (
+        f"Untagged+scaffold: page {page_num+1}, imgIdx {img_index}, "
+        f"MCID {mcid}, struct xref {fig_xref}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +682,86 @@ def remediate_pdf():
         print(f"❌ [Polly Core] Crash: {e}")
         return jsonify({"error": f"Internal error: {e}"}), 500
 
+def find_alt_in_struct_tree(doc: fitz.Document, page_num: int, img_index: int) -> str:
+    """
+    Look for existing /Alt text for an image in the struct tree.
+    Checks both the image XObject dict (untagged path) and Figure struct
+    elements (tagged path, used by Word/InDesign exports).
+    Returns the alt string if found, empty string if not.
+    """
+    # Fast path: alt on the XObject dict itself
+    try:
+        images = doc[page_num].get_images(full=True)
+        raster = [i for i in images if i[2] > 1]
+        if img_index < len(raster):
+            img_xref = raster[img_index][0]
+            obj = doc.xref_object(img_xref)
+            alt_m = re.search(r'/Alt\s*\(([^)]*)\)', obj)
+            if alt_m:
+                return alt_m.group(1)
+    except Exception:
+        pass
 
+    # Struct tree path
+    try:
+        cat = doc.xref_object(doc.pdf_catalog())
+        str_m = re.search(r"/StructTreeRoot\s+(\d+)\s+0\s+R", cat)
+        if not str_m:
+            return ""
+
+        page_xref = doc[page_num].xref
+        content = doc[page_num].read_contents().decode("latin-1", errors="ignore")
+
+        # First try: match via /Figure BDC MCID markers in content stream
+        figure_bdcs = list(re.finditer(
+            r'/Figure\s*<<[^>]*/MCID\s+(\d+)[^>]*>>\s*BDC', content
+        ))
+        target_mcid = None
+        if img_index < len(figure_bdcs):
+            target_mcid = int(figure_bdcs[img_index].group(1))
+
+        # Collect all Figure struct elements on this page in xref order
+        page_figures = []
+        for xref in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xref)
+                if not obj or '/Figure' not in obj:
+                    continue
+                s_m = re.search(r'/S\s+(/\w+)', obj)
+                if not s_m or s_m.group(1) != '/Figure':
+                    continue
+                pg_m = re.search(r'/Pg\s+(\d+)\s+0\s+R', obj)
+                if not pg_m or int(pg_m.group(1)) != page_xref:
+                    continue
+                alt_m = re.search(r'/Alt\s*\(([^)]*)\)', obj)
+                k_m = re.search(r'/K\s+\[?\s*(\d+)\s*\]?', obj)
+                page_figures.append({
+                    'xref': xref,
+                    'mcid': int(k_m.group(1)) if k_m else -1,
+                    'alt': alt_m.group(1) if alt_m else '',
+                })
+            except Exception:
+                pass
+
+        if not page_figures:
+            return ""
+
+        # If we found a target MCID via content stream, match on that
+        if target_mcid is not None:
+            for fig in page_figures:
+                if fig['mcid'] == target_mcid:
+                    return fig['alt']
+
+        # Fallback: return the nth Figure element on this page by xref order
+        # This handles Word/Quartz PDFs where content stream has no BDC markers
+        if img_index < len(page_figures):
+            return page_figures[img_index]['alt']
+
+    except Exception:
+        pass
+
+    return ""
+    
 @app.route("/inspect", methods=["POST"])
 def inspect_pdf():
     """
@@ -606,7 +779,8 @@ def inspect_pdf():
         pages = {}
         for page_num in range(doc.page_count):
             images = doc[page_num].get_images(full=True)
-            if images:
+            raster = [img for img in images if img[2] > 1]
+            if raster:
                 pages[str(page_num)] = [
                     {
                         "imgIdx": i,
@@ -614,8 +788,9 @@ def inspect_pdf():
                         "width": img[2],
                         "height": img[3],
                         "name": img[7],
+                        "existingAlt": find_alt_in_struct_tree(doc, page_num, i),
                     }
-                    for i, img in enumerate(images)
+                    for i, img in enumerate(raster)
                 ]
 
         doc.close()
