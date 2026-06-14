@@ -362,6 +362,23 @@ function polly_pdf_workspace_page() {
 
                 try {
                     const arrayBuffer = await file.arrayBuffer();
+
+                    // Ask Python for image metadata including any existing alt text
+                    const inspectForm = new FormData();
+                    inspectForm.append('pdf', file);
+                    let inspectData = { pages: {} };
+                    try {
+                        const inspectResp = await fetch(`${config.serverUrl}/inspect`, {
+                            method: 'POST',
+                            body: inspectForm
+                        });
+                        if (inspectResp.ok) {
+                            inspectData = await inspectResp.json();
+                            console.log('Inspect data:', JSON.stringify(inspectData, null, 2));
+                        }
+                    } catch(e) {
+                        console.warn('Could not reach inspect endpoint:', e);
+                    }
                     
                     // Check Structure Root via PDF-lib
                     const pdfDocCheck = await PDFDocument.load(arrayBuffer.slice(0));
@@ -382,6 +399,7 @@ function polly_pdf_workspace_page() {
                     });
                     const pdf = await loadingTask.promise;
                     let foundCount = 0;
+                    let pageCounts = {};
 
                     for (let i = 1; i <= pdf.numPages; i++) {
                         loadingSub.innerText = `Scanning Page ${i} of ${pdf.numPages}...`;
@@ -395,8 +413,23 @@ function polly_pdf_workspace_page() {
                                 const imgName = operatorList.argsArray[j][0];
                                 const imgObj = await new Promise(r => page.objs.get(imgName, r));
                                 if (imgObj) {
+                                    const pageIdx = i - 1;
+                                    const pageImages = inspectData.pages[String(pageIdx)] || [];
+                                    // PDF.js uses generated names like "img_p3_1" (1-based)
+                                    // Parse the index from the name, fall back to per-page counter
+                                    let pageImgIndex;
+                                    const nameMatch = imgName.match(/img_p\d+_(\d+)/);
+                                    if (nameMatch) {
+                                        pageImgIndex = parseInt(nameMatch[1]) - 1; // convert to 0-based
+                                    } else {
+                                        pageImgIndex = pageCounts[pageIdx] || 0;
+                                    }
+                                    pageCounts[pageIdx] = (pageCounts[pageIdx] || 0) + 1;
+                                    const imgMeta = pageImages[pageImgIndex] || null;
+                                    console.log(`Page ${pageIdx} imgName="${imgName}" pageImgIndex=${pageImgIndex} imgMeta=`, imgMeta);
+                                    const existingAlt = imgMeta ? (imgMeta.existingAlt || '') : '';
                                     foundCount++;
-                                    renderImageToGallery(imgObj, i, foundCount, i - 1, imgName);
+                                    renderImageToGallery(imgObj, i, foundCount, pageIdx, imgName, existingAlt);
                                 }
                             }
                         }
@@ -415,7 +448,7 @@ function polly_pdf_workspace_page() {
                 }
             }
 
-            function renderImageToGallery(imgObj, pageNum, index, pageIdx, imgName) {
+            function renderImageToGallery(imgObj, pageNum, index, pageIdx, imgName, existingAlt = '') {
                 const canvas = document.createElement('canvas');
                 canvas.width = imgObj.width; canvas.height = imgObj.height;
                 const ctx = canvas.getContext('2d');
@@ -433,6 +466,7 @@ function polly_pdf_workspace_page() {
                         ctx.putImageData(new ImageData(rgbaData, imgObj.width, imgObj.height), 0, 0);
                     }
                     const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+                    const alreadyTagged = existingAlt.length > 0;
                     const card = document.createElement('div');
                     card.className = 'image-card';
                     card.id = `img-card-${index}`;
@@ -441,15 +475,31 @@ function polly_pdf_workspace_page() {
                     card.innerHTML = `
                         <img src="${dataUrl}">
                         <div class="image-info" style="margin-top: 10px; font-size: 0.8rem;">
-                            <span class="badge badge-untagged" id="badge-${index}" style="display: inline-block; padding: 2px 6px; border-radius: 4px; font-weight: bold; text-transform: uppercase; font-size: 0.65rem; margin-bottom: 8px;">Untagged</span>
+                            <span class="badge ${alreadyTagged ? 'badge-remediated' : 'badge-untagged'}" id="badge-${index}" style="display: inline-block; padding: 2px 6px; border-radius: 4px; font-weight: bold; text-transform: uppercase; font-size: 0.65rem; margin-bottom: 8px;">${alreadyTagged ? 'Already Tagged' : 'Untagged'}</span>
                             <div><strong>Asset #${index}</strong> (Page ${pageNum})</div>
                             <div id="content-${index}">
-                                <button class="button button-secondary" id="btn-${index}" style="width: 100%; margin-top: 10px; font-weight: bold;" onclick="window.addToQueue(${index}, '${dataUrl.split(',')[1]}', ${pageIdx}, '${imgName}')">Recommend Alt Text</button>
+                                <textarea
+                                    id="alt-text-${index}"
+                                    rows="3"
+                                    style="width:100%; margin-top:10px; font-size:0.8rem; padding:6px; box-sizing:border-box; border:1px solid #ccc; border-radius:4px;"
+                                    placeholder="Alt text will appear here — edit before downloading..."
+                                >${existingAlt}</textarea>
+                                <button class="button button-secondary" id="btn-${index}" style="width: 100%; margin-top: 8px; font-weight: bold;" onclick="window.addToQueue(${index}, '${dataUrl.split(',')[1]}', ${pageIdx}, '${imgName}')">
+                                    ${alreadyTagged ? 'Regenerate Alt Text' : 'Recommend Alt Text'}
+                                </button>
+                                ${alreadyTagged ? `<div style="margin-top:6px; font-size:0.7rem; color:#666;">Alt text found in document. Edit above or regenerate.</div>` : ''}
                             </div>
                         </div>
                     `;
                     imageList.appendChild(card);
-                } catch (e) { console.error(e); }
+                    // Store metadata at render time so download works for pre-tagged images
+                    remediationResults[index] = {
+                        pageIdx: pageIdx,
+                        imgIdx: index - 1,
+                        imgName: imgName,
+                        alt: existingAlt
+                    };
+                } catch(e) { console.error('renderImageToGallery error:', e); }
             }
 
             window.addToQueue = function(index, base64, pageIdx, imgName) {
@@ -518,19 +568,38 @@ function polly_pdf_workspace_page() {
                 remediationResults[task.index] = {
                     alt: data.alt,
                     pageIdx: task.pageIdx,
-                    imgName: task.imgName
+                    imgName: task.imgName,
+                    imgIdx: task.imgIdx
                 };
                 
                 remediatedCount++;
                 task.badge.className = "badge badge-remediated";
                 task.badge.innerText = "Remediated";
-                
+
+                // Populate the textarea with Gemini's suggestion
+                const textarea = document.getElementById(`alt-text-${task.index}`);
+                if (textarea) {
+                    textarea.value = data.alt;
+                }
                 const isLong = data.alt.length > 125;
                 task.container.innerHTML = `
-                    <div class="alt-result">${data.alt}</div>
-                    <div class="char-counter ${isLong ? 'over-limit' : ''}">${data.alt.length} / 125 characters</div>
+                    <textarea
+                        id="alt-text-${task.index}"
+                        rows="3"
+                        style="width:100%; margin-top:10px; font-size:0.8rem; padding:6px; box-sizing:border-box; border:1px solid #ccc; border-radius:4px;"
+                    >${data.alt}</textarea>
+                    <div class="char-counter ${isLong ? 'over-limit' : ''}" id="char-${task.index}">${data.alt.length} / 125 characters</div>
                     <div class="explanation" style="margin-top: 8px; color: #666; font-size: 0.7rem;"><strong>Logic:</strong> ${data.explanation}</div>
                 `;
+                // Live character counter
+                document.getElementById(`alt-text-${task.index}`).addEventListener('input', function() {
+                    const len = this.value.length;
+                    const counter = document.getElementById(`char-${task.index}`);
+                    if (counter) {
+                        counter.textContent = `${len} / 125 characters`;
+                        counter.className = `char-counter ${len > 125 ? 'over-limit' : ''}`;
+                    }
+                });
                 updateDownloadButton();
             }
 
@@ -547,13 +616,19 @@ function polly_pdf_workspace_page() {
                 try {
                     // Clean up our remediation results metadata map to make sure it includes the asset names
                     const formattedMetadata = {};
-                    for (const [key, value] of Object.entries(remediationResults)) {
-                        formattedMetadata[key] = {
-                            alt: value.alt,
-                            pageIdx: value.pageIdx,
-                            imgName: value.imgName // Crucial Phase 3 addition!
-                        };
-                    }
+                    document.querySelectorAll('textarea[id^="alt-text-"]').forEach(textarea => {
+                        const idx = textarea.id.replace('alt-text-', '');
+                        const altText = textarea.value.trim();
+                        if (!altText) return;
+                        if (remediationResults[idx]) {
+                            formattedMetadata[idx] = {
+                                alt: altText,
+                                pageIdx: remediationResults[idx].pageIdx,
+                                imgName: remediationResults[idx].imgName,
+                                imgIdx: remediationResults[idx].imgIdx
+                            };
+                        }
+                    });
 
                     const formPayload = new FormData();
                     formPayload.append('pdf', currentPdfFile);
