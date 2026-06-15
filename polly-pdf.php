@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Polly PDF
  * Description: Powered by SeaMonster Studios. Extracts images from uploads and performs serverless structural PDF/UA alt-tagging.
- * Version: 0.2.0
+ * Version: 0.3.0
  * Author: SeaMonster Studios
  * Author URI: https://www.seamonsterstudios.com
  * Text Domain: polly-pdf
@@ -10,7 +10,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'POLLY_PDF_VERSION', '0.2.0' );
+define( 'POLLY_PDF_VERSION', '0.3.0' );
 define( 'POLLY_PDF_PLUGIN_FILE', __FILE__ );
 
 function polly_pdf_get_available_models() {
@@ -106,6 +106,12 @@ add_action( 'admin_init', function () {
     register_setting( 'polly_pdf_group', 'polly_pdf_api_key' );
     register_setting( 'polly_pdf_group', 'polly_pdf_model' );
     register_setting( 'polly_pdf_group', 'polly_pdf_server_url' );
+    register_setting( 'polly_pdf_group', 'polly_pdf_choice_count', [
+        'sanitize_callback' => function( $val ) {
+            $v = intval( $val );
+            return max( 1, min( 6, $v ) );
+        }
+    ] );
 
     add_settings_section( 'polly_pdf_main_section', "Configuration", null, 'polly-pdf-settings' );
 
@@ -114,6 +120,14 @@ add_action( 'admin_init', function () {
         ?>
         <input type="password" name="polly_pdf_api_key" value="<?php echo esc_attr( $val ); ?>" class="regular-text" autocomplete="off">
         <p class="description">Get your API key at <a href="https://aistudio.google.com/app/apikey" target="_blank">Google AI Studio</a>.</p>
+        <?php
+    }, 'polly-pdf-settings', 'polly_pdf_main_section' );
+
+    add_settings_field( 'choice_count', 'Alt Text Choices', function () {
+        $val = intval( get_option( 'polly_pdf_choice_count', 3 ) );
+        ?>
+        <input type="number" name="polly_pdf_choice_count" value="<?php echo esc_attr( $val ); ?>" min="1" max="6" style="width: 60px;">
+        <p class="description">How many AI-generated alt text options to show per image (default: 3).</p>
         <?php
     }, 'polly-pdf-settings', 'polly_pdf_main_section' );
 
@@ -277,25 +291,8 @@ function polly_pdf_workspace_page() {
                     </div>
                 </div>
 
-                <style>
-                    #drop-zone.hover { background: #f0faff !important; border-color: #00a0d2 !important; transform: scale(1.01); }
-                    #drop-zone.has-file { border-style: solid !important; height: auto !important; padding: 40px !important; }
-                    .hidden { display: none !important; }
-                    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-                    .polly-badge-legacy { background: #fff3cd !important; color: #856404 !important; border: 1px solid #ffeeba !important; }
-                    .polly-badge-tagged { background: #d4edda !important; color: #155724 !important; border: 1px solid #c3e6cb !important; }
-                    .image-card { background: #f6f7f7; border: 1px solid #ccd0d4; border-radius: 8px; margin-bottom: 20px; overflow: hidden; }
-                    .image-card img { width: 100%; height: 200px; object-fit: contain; background: #e5e5e5; display: block; }
-                    .image-card .badge-untagged { background: #fcf0f1; color: #d63638; border: 1px solid #f1c3c4; }
-                    .image-card .badge-queued { background: #fff8e5; color: #856404; border: 1px solid #ffeeba; }
-                    .image-card .badge-remediated { background: #ecf7ed; color: #46b450; border: 1px solid #c1e8c5; }
-                    .alt-result { margin-top: 10px; padding: 10px; background: #f9f9f9; border-left: 3px solid #0073aa; font-style: italic; word-wrap: break-word; font-size: 0.8rem; }
-                    .char-counter { text-align: right; font-size: 0.7rem; color: #999; margin-top: 4px; }
-                    .char-counter.over-limit { color: #d63638; font-weight: bold; }
-                </style>
-
                 <div id="status-bar" style="position: absolute; bottom: 0; left: 0; right: 0; padding: 10px 20px; background: white; border-top: 1px solid #ccd0d4; font-size: 0.85rem; display: flex; justify-content: space-between;">
-                    <span id="status-left">Polly PDF & Fido Core v0.2.0</span>
+                    <span id="status-left">Polly PDF v0.3.0</span>
                     <span id="status-right" style="font-weight: 600;">Idle</span>
                 </div>
             </div>
@@ -308,6 +305,7 @@ function polly_pdf_workspace_page() {
             const config = {
                 model: '<?php echo esc_js( get_option( "polly_pdf_model", "gemini-2.0-flash" ) ); ?>',
                 serverUrl: '<?php echo esc_js( get_option( "polly_pdf_server_url", "http://localhost:5001" ) ); ?>',
+                choiceCount: <?php echo intval( get_option( 'polly_pdf_choice_count', 3 ) ); ?>,
                 ajaxUrl: '<?php echo esc_js( admin_url( "admin-ajax.php" ) ); ?>',
                 nonce: '<?php echo esc_js( wp_create_nonce( "polly_pdf_nonce" ) ); ?>'
             };
@@ -485,7 +483,7 @@ function polly_pdf_workspace_page() {
                                     placeholder="Alt text will appear here — edit before downloading..."
                                 >${existingAlt}</textarea>
                                 <button class="button button-secondary" id="btn-${index}" style="width: 100%; margin-top: 8px; font-weight: bold;" onclick="window.addToQueue(${index}, '${dataUrl.split(',')[1]}', ${pageIdx}, '${imgName}')">
-                                    ${alreadyTagged ? 'Regenerate Alt Text' : 'Recommend Alt Text'}
+                                    ${alreadyTagged ? 'Preview & Refine' : 'Preview & Generate'}
                                 </button>
                                 ${alreadyTagged ? `<div style="margin-top:6px; font-size:0.7rem; color:#666;">Alt text found in document. Edit above or regenerate.</div>` : ''}
                             </div>
@@ -499,6 +497,11 @@ function polly_pdf_workspace_page() {
                         imgName: imgName,
                         alt: existingAlt
                     };
+                    // Enable download button as soon as any textarea has content
+                    const textarea = document.getElementById(`alt-text-${index}`);
+                    if (textarea) {
+                        textarea.addEventListener('input', updateDownloadButton);
+                    }
                 } catch(e) { console.error('renderImageToGallery error:', e); }
             }
 
@@ -532,7 +535,7 @@ function polly_pdf_workspace_page() {
             }
 
             async function runRemediation(task, retryCount = 0) {
-                const prompt = `Task: Generate accessibility alt text and technical logic for this image. HARD CONSTRAINT: The 'alt' value MUST NOT exceed 125 characters. LOGIC CONSTRAINT: The 'explanation' value must be no more than two sentences. Format: JSON ONLY {"alt": "...", "explanation": "..."}`;
+                const prompt = `Task: Generate exactly ${config.choiceCount} distinct alt text variations for this image. Each must foreground a DIFFERENT visible subject or element as its opening focus. HARD CONSTRAINT: Each 'alt' value MUST NOT exceed 125 characters. Format: JSON array ONLY — no markdown, no preamble. Schema: [{"alt": "...", "focus": "short noun phrase naming the visual element", "explanation": "one sentence max"}, ...]`;
 
                 const payload = JSON.stringify({
                     contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: "image/jpeg", data: task.base64 } }] }],
@@ -604,8 +607,13 @@ function polly_pdf_workspace_page() {
             }
 
             function updateDownloadButton() {
-                readySub.innerText = `${remediatedCount} assets remediated.`;
-                downloadBtn.disabled = remediatedCount === 0;
+                // Count textareas that have non-empty content
+                const filledCount = Array.from(
+                    document.querySelectorAll('textarea[id^="alt-text-"]')
+                ).filter(t => t.value.trim().length > 0).length;
+
+                readySub.innerText = `${filledCount} asset${filledCount !== 1 ? 's' : ''} ready to download.`;
+                downloadBtn.disabled = filledCount === 0;
             }
 
             // Post compiled remediation payload to our python serverless backend
@@ -671,6 +679,13 @@ function polly_pdf_workspace_page() {
 // Enqueue dependencies for our PDF dashboard screen
 add_action( 'admin_enqueue_scripts', function ( $hook ) {
     if ( 'toplevel_page_polly-pdf-workspace' !== $hook ) return;
+
+    wp_enqueue_style(
+        'polly-pdf-styles',
+        plugin_dir_url( POLLY_PDF_PLUGIN_FILE ) . 'polly-pdf.css',
+        [],
+        POLLY_PDF_VERSION
+    );
 
     wp_enqueue_script(
         'pdf-lib-script',
