@@ -460,6 +460,10 @@ def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_tex
     Full tagged-PDF remediation pipeline for one image.
     Returns a status string for logging.
     """
+    # Diagnostic: check content stream for Figure BDC markers
+    content = doc[page_num].read_contents().decode("latin-1", errors="ignore")
+    figure_bdcs = re.findall(r'/Figure\s*<<[^>]*/MCID\s+(\d+)[^>]*>>\s*BDC', content)
+    print(f"🦜 [Polly Core] inject_alt_tagged: page={page_num} imgIdx={img_index} figure_bdcs_in_stream={figure_bdcs}")
     mcid = get_struct_tree_next_key(doc)
     page_xref = doc[page_num].xref
 
@@ -646,6 +650,15 @@ def remediate_pdf():
                 continue
 
             try:
+                is_decorative = data.get("decorative", False)
+
+                if is_decorative:
+                    # Phase 1 stub: skip decorative images until full artifact
+                    # pipeline is implemented in Phase 2
+                    print(f"🦜 [Polly Core] ⬜ Asset {asset_id}: marked decorative — skipping (Phase 2 pending)")
+                    results.append(f"Decorative (stub): page {page_num+1}, imgIdx {img_index}")
+                    continue
+
                 if tagged:
                     status = inject_alt_tagged(doc, page_num, img_index, alt_text, img_name)
                 else:
