@@ -373,16 +373,48 @@ def create_figure_struct_element(
     return fig_xref
 
 
-def append_to_document_struct_k(doc: fitz.Document, new_xref: int) -> None:
-    """Add the new struct element xref to the appropriate /K array."""
+def append_to_document_struct_k(doc: fitz.Document, new_xref: int, page_xref: int) -> None:
+    """
+    Insert the new struct element into the StructTreeRoot /K array at the correct
+    reading-order position — after the last existing element on the same page,
+    rather than blindly appending at the end.
+    """
     target_xref = _get_document_struct_xref(doc)
     target_obj = doc.xref_object(target_xref)
 
+    # Parse the existing K array entries
+    k_match = re.search(r'/K\s*\[([^\]]+)\]', target_obj, re.DOTALL)
+    if not k_match:
+        raise ValueError("Could not find /K array in struct element")
+
+    entries = re.findall(r'(\d+)\s+0\s+R', k_match.group(1))
     new_ref = f"{new_xref} 0 R"
+
+    # Find the last entry whose /Pg matches our page_xref
+    insert_after = -1
+    for i, entry_xref_str in enumerate(entries):
+        try:
+            obj = doc.xref_object(int(entry_xref_str))
+            pg = re.search(r'/Pg\s+(\d+)\s+0\s+R', obj)
+            if pg and int(pg.group(1)) == page_xref:
+                insert_after = i
+        except:
+            pass
+
+    if insert_after >= 0:
+        # Insert after the last same-page element
+        entries.insert(insert_after + 1, new_ref)
+    else:
+        # No existing elements on this page found — append at end
+        entries.append(new_ref)
+
+    # Rebuild the K array
+    entries_str = '\n      '.join(entries)
     updated = re.sub(
-        r"(/K\s*\[)([^\]]+)(\])",
-        lambda m: m.group(1) + m.group(2) + f"\n      {new_ref} " + m.group(3),
+        r'(/K\s*\[)[^\]]+(\])',
+        lambda m: m.group(1) + '\n      ' + entries_str + ' ' + m.group(2),
         target_obj,
+        flags=re.DOTALL
     )
 
     if updated == target_obj:
@@ -455,10 +487,81 @@ def increment_parent_tree_next_key(doc: fitz.Document, used_mcid: int) -> None:
     doc.update_object(struct_root_xref, updated)
 
 
+def _uses_page_local_mcids(doc: fitz.Document, page_num: int) -> bool:
+    """
+    Detect whether this PDF uses page-local MCID arrays (Acrobat style)
+    vs global MCID keys (InDesign style).
+    Page-local: ParentTree[StructParents] -> an array object
+    Global: ParentTree[StructParents] -> a single struct element ref
+    """
+    try:
+        page = doc[page_num]
+        page_obj = doc.xref_object(page.xref)
+        sp_match = re.search(r'/StructParents\s+(\d+)', page_obj)
+        if not sp_match:
+            return False
+        sp_val = int(sp_match.group(1))
+
+        pt_xref = _get_parent_tree_xref(doc)
+        pt = doc.xref_object(pt_xref)
+
+        entry_match = re.search(rf'\b{sp_val}\s+(\d+)\s+0\s+R', pt)
+        if not entry_match:
+            return False
+
+        candidate_xref = int(entry_match.group(1))
+        candidate = doc.xref_object(candidate_xref)
+        # If it starts with '[' it's an array (page-local), else it's a dict (global)
+        return candidate.strip().startswith('[')
+    except Exception:
+        return False
+
+
+def _get_page_struct_parents_array_xref(doc: fitz.Document, page_num: int) -> int:
+    """Get the xref of the StructParents array for this page."""
+    page = doc[page_num]
+    page_obj = doc.xref_object(page.xref)
+    sp_val = int(re.search(r'/StructParents\s+(\d+)', page_obj).group(1))
+    pt_xref = _get_parent_tree_xref(doc)
+    pt = doc.xref_object(pt_xref)
+    entry_match = re.search(rf'\b{sp_val}\s+(\d+)\s+0\s+R', pt)
+    return int(entry_match.group(1))
+
+
+def _get_next_free_mcid_in_page_array(doc: fitz.Document, arr_xref: int) -> int:
+    """
+    Find the first null slot index in a page's StructParents array.
+    That index becomes the MCID for our new Figure.
+    """
+    arr = doc.xref_object(arr_xref)
+    slots = re.findall(r'(\d+ 0 R|null)', arr)
+    for i, slot in enumerate(slots):
+        if slot == 'null':
+            return i
+    # No nulls — return next index (we'll append)
+    return len(slots)
+
+
+def _insert_struct_elem_into_page_array(
+    doc: fitz.Document, arr_xref: int, slot_index: int, fig_xref: int
+) -> None:
+    """Replace the null at slot_index in the array with our new struct element xref."""
+    arr = doc.xref_object(arr_xref)
+    slots = re.findall(r'(\d+ 0 R|null)', arr)
+
+    if slot_index < len(slots) and slots[slot_index] == 'null':
+        slots[slot_index] = f'{fig_xref} 0 R'
+    else:
+        slots.append(f'{fig_xref} 0 R')
+
+    new_arr = '[ ' + ' '.join(slots) + ' ]'
+    doc.update_object(arr_xref, new_arr)
+
+
 def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_text: str, img_name: str = "") -> str:
     """
     Full tagged-PDF remediation pipeline for one image.
-    Returns a status string for logging.
+    Automatically handles both page-local (Acrobat) and global (InDesign) MCID systems.
     """
     # Diagnostic: check content stream for Figure BDC markers
     content = doc[page_num].read_contents().decode("latin-1", errors="ignore")
@@ -467,16 +570,35 @@ def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_tex
     mcid = get_struct_tree_next_key(doc)
     page_xref = doc[page_num].xref
 
+    if _uses_page_local_mcids(doc, page_num):
+        # PAGE-LOCAL path: MCID = slot index in the page's StructParents array
+        arr_xref = _get_page_struct_parents_array_xref(doc, page_num)
+        mcid = _get_next_free_mcid_in_page_array(doc, arr_xref)
+
+        rewrite_content_stream_for_image(doc, page_num, img_index, mcid)
+        fig_xref = create_figure_struct_element(doc, page_xref, mcid, alt_text, page_num, img_index)
+        append_to_document_struct_k(doc, fig_xref, page_xref)
+        _insert_struct_elem_into_page_array(doc, arr_xref, mcid, fig_xref)
+        # No ParentTreeNextKey to update in page-local mode
+
+        return (
+            f"Tagged (page-local): page {page_num+1}, imgIdx {img_index} "
+            f"-> MCID {mcid} (slot in StructParents array), struct xref {fig_xref}"
+        )
+    else:
+        # GLOBAL path: MCID = ParentTreeNextKey, added as new top-level Nums entry
+        mcid = get_struct_tree_next_key(doc)
+
     rewrite_content_stream_by_name_or_index(doc, page_num, img_index, img_name, mcid)
     fig_xref = create_figure_struct_element(doc, page_xref, mcid, alt_text, page_num, img_index)
     append_to_document_struct_k(doc, fig_xref)
     update_parent_tree(doc, mcid, fig_xref)
     increment_parent_tree_next_key(doc, mcid)
 
-    return (
-        f"Tagged: page {page_num+1}, imgIdx {img_index} "
-        f"-> MCID {mcid}, struct xref {fig_xref}"
-    )
+        return (
+            f"Tagged (global): page {page_num+1}, imgIdx {img_index} "
+            f"-> MCID {mcid}, struct xref {fig_xref}"
+        )
 
 def _get_image_resource_name(doc: fitz.Document, page_num: int, img_xref: int) -> str:
     """
