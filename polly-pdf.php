@@ -483,7 +483,7 @@ function polly_pdf_workspace_page() {
                                         console.log(`Page ${pageIdx} imgName="${imgName}" pageImgIndex=${pageImgIndex} imgMeta=`, imgMeta);
                                         const existingAlt = imgMeta ? (imgMeta.existingAlt || '') : '';
                                         foundCount++;
-                                        renderImageToGallery(imgObj, i, foundCount, pageIdx, imgName, existingAlt);
+                                        renderImageToGallery(imgObj, i, foundCount, pageIdx, imgName, existingAlt, pageImgIndex);
                                     }
                                 }
                             }
@@ -502,7 +502,7 @@ function polly_pdf_workspace_page() {
                     }
                 }
 
-                function renderImageToGallery(imgObj, pageNum, index, pageIdx, imgName, existingAlt = '') {
+                function renderImageToGallery(imgObj, pageNum, index, pageIdx, imgName, existingAlt = '', pageImgIndex = 0) {
                     const canvas = document.createElement('canvas');
                     canvas.width = imgObj.width; canvas.height = imgObj.height;
                     const ctx = canvas.getContext('2d');
@@ -549,7 +549,7 @@ function polly_pdf_workspace_page() {
                         // Store metadata at render time so download works for pre-tagged images
                         remediationResults[index] = {
                             pageIdx: pageIdx,
-                            imgIdx: index - 1,
+                            imgIdx: pageImgIndex,
                             imgName: imgName,
                             alt: existingAlt
                         };

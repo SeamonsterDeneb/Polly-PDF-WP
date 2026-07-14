@@ -391,29 +391,33 @@ def append_to_document_struct_k(doc: fitz.Document, new_xref: int) -> None:
     doc.update_object(target_xref, updated)
 
 
-def update_parent_tree(doc: fitz.Document, mcid: int, struct_xref: int) -> None:
+def update_parent_tree(doc: fitz.Document, mcid: int, struct_xref: int, page_num: int = 0) -> None:
     """
     Add a new MCID->struct_xref mapping to the ParentTree.
-
-    The ParentTree /Nums array maps PAGE SLOT indices (the /StructParents
-    value on each page dict) to arrays of struct element refs — one ref
-    per MCID on that page, in MCID order.
-
-    For Acrobat/LibreOffice docs the new Figure's MCID may not be
-    contiguous with the existing ones, so we append to the existing
-    page-slot array rather than adding a new top-level entry.
+    Uses the page's /StructParents value to find the correct slot.
     """
     pt_xref = _get_parent_tree_xref(doc)
     pt_obj = doc.xref_object(pt_xref)
 
-    # Find the page-slot array that already exists for slot 0
-    # (for single-page docs this is always slot 0; multi-page handled below)
-    # Pattern: 0 [ ref ref ref ... ]
-    slot_array_m = re.search(r'(0\s+\[)([^\]]*?)(\])', pt_obj)
+    # Get the page's StructParents slot number
+    page_obj = doc.xref_object(doc[page_num].xref)
+    sp_m = re.search(r'/StructParents\s+(\d+)', page_obj)
+    page_slot = int(sp_m.group(1)) if sp_m else 0
+
+    print(f"🦜 [Polly Core] update_parent_tree: page={page_num} slot={page_slot} mcid={mcid} struct_xref={struct_xref}")
+
+    # Look for existing array for this page's slot
+    slot_array_m = re.search(
+        rf'({page_slot}\s+\[)([^\]]*?)(\])',
+        pt_obj
+    )
     if slot_array_m:
-        # Append new struct ref to the existing array for this page slot
         existing_entries = slot_array_m.group(2)
-        new_entries = existing_entries.rstrip() + f"\n        {struct_xref} 0 R "
+        # Handle empty array — can't just append with leading newline
+        if existing_entries.strip():
+            new_entries = existing_entries.rstrip() + f"\n        {struct_xref} 0 R "
+        else:
+            new_entries = f" {struct_xref} 0 R "
         updated = (
             pt_obj[:slot_array_m.start(2)]
             + new_entries
@@ -422,8 +426,7 @@ def update_parent_tree(doc: fitz.Document, mcid: int, struct_xref: int) -> None:
         doc.update_object(pt_xref, updated)
         return
 
-    # No existing array for slot 0 — fall back to appending a new Nums entry
-    # (this is the InDesign path where each MCID gets its own top-level slot)
+    # No existing array for this slot — append new Nums entry
     new_entry = f"\n  {mcid} {struct_xref} 0 R"
     if pt_obj.rstrip().endswith("]"):
         updated = pt_obj.rstrip()[:-1] + new_entry + "\n]"
@@ -458,19 +461,73 @@ def increment_parent_tree_next_key(doc: fitz.Document, used_mcid: int) -> None:
 def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_text: str, img_name: str = "") -> str:
     """
     Full tagged-PDF remediation pipeline for one image.
-    Returns a status string for logging.
+    Fast path: if an existing Figure struct element is found for this image
+    (by MCID match or nth-by-xref-order for Word/Quartz PDFs), just update /Alt.
+    Full path: rewrite content stream and wire a new struct element.
     """
+    safe_alt = alt_text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
     # Diagnostic: check content stream for Figure BDC markers
     content = doc[page_num].read_contents().decode("latin-1", errors="ignore")
     figure_bdcs = re.findall(r'/Figure\s*<<[^>]*/MCID\s+(\d+)[^>]*>>\s*BDC', content)
     print(f"🦜 [Polly Core] inject_alt_tagged: page={page_num} imgIdx={img_index} figure_bdcs_in_stream={figure_bdcs}")
-    mcid = get_struct_tree_next_key(doc)
+
     page_xref = doc[page_num].xref
 
+    # Fast path: find existing Figure struct element on this page
+    # First try MCID match via content stream BDC markers
+    target_mcid = None
+    if img_index < len(figure_bdcs):
+        target_mcid = int(figure_bdcs[img_index])
+
+    # Collect all Figure struct elements on this page in xref order
+    page_figures = []
+    for xref in range(1, doc.xref_length()):
+        try:
+            obj = doc.xref_object(xref)
+            if not obj or '/Figure' not in obj:
+                continue
+            s_m = re.search(r'/S\s+(/\w+)', obj)
+            if not s_m or s_m.group(1) != '/Figure':
+                continue
+            pg_m = re.search(r'/Pg\s+(\d+)\s+0\s+R', obj)
+            if not pg_m or int(pg_m.group(1)) != page_xref:
+                continue
+            k_m = re.search(r'/K\s+\[?\s*(\d+)\s*\]?', obj)
+            page_figures.append((xref, int(k_m.group(1)) if k_m else -1))
+        except Exception:
+            pass
+
+    existing_xref = None
+    if target_mcid is not None:
+        # Match by MCID
+        for xref, mcid in page_figures:
+            if mcid == target_mcid:
+                existing_xref = xref
+                break
+    elif img_index < len(page_figures):
+        # Fallback: nth Figure element by xref order (Word/Quartz PDFs)
+        existing_xref = page_figures[img_index][0]
+
+    if existing_xref is not None:
+        obj = doc.xref_object(existing_xref)
+        if "/Alt" in obj:
+            updated = re.sub(r"/Alt\s*\([^)]*\)", f"/Alt ({safe_alt}\\000)", obj)
+        else:
+            updated = obj.rstrip().rstrip(">").rstrip() + f"\n  /Alt ({safe_alt}\\000)\n>>"
+        doc.update_object(existing_xref, updated)
+        print(f"🦜 [Polly Core] Fast path: updated existing Figure xref={existing_xref}")
+        return (
+            f"Tagged (fast path): page {page_num+1}, imgIdx {img_index} "
+            f"-> existing Figure xref {existing_xref}"
+        )
+
+    # Full path: no existing Figure found — rewrite content stream
+    mcid = get_struct_tree_next_key(doc)
     rewrite_content_stream_by_name_or_index(doc, page_num, img_index, img_name, mcid)
     fig_xref = create_figure_struct_element(doc, page_xref, mcid, alt_text, page_num, img_index)
     append_to_document_struct_k(doc, fig_xref)
-    update_parent_tree(doc, mcid, fig_xref)
+    update_parent_tree(doc, mcid, fig_xref, page_num)
     increment_parent_tree_next_key(doc, mcid)
 
     return (
@@ -507,10 +564,13 @@ def _ensure_struct_tree(doc: fitz.Document) -> None:
 
     print("🦜 [Polly Core] Building struct tree scaffold for untagged PDF")
 
-    # 1. ParentTree
+    # 1. ParentTree — pre-populate one empty slot per page
     pt_xref = doc.get_new_xref()
     print(f"🦜 [Polly Core] scaffold step 1: ParentTree xref={pt_xref}")
-    doc.update_object(pt_xref, "<< /Nums [] >>")
+    nums_entries = ""
+    for i in range(doc.page_count):
+        nums_entries += f"\n    {i} []"
+    doc.update_object(pt_xref, f"<< /Nums [{nums_entries}\n  ] >>")
 
     # 2. Document struct element
     doc_xref = doc.get_new_xref()
@@ -598,7 +658,7 @@ def inject_alt_untagged(doc: fitz.Document, page_num: int, img_index: int, alt_t
 
     # Wire it into the struct tree
     append_to_document_struct_k(doc, fig_xref)
-    update_parent_tree(doc, mcid, fig_xref)
+    update_parent_tree(doc, mcid, fig_xref, page_num)
     increment_parent_tree_next_key(doc, mcid)
 
     return (
