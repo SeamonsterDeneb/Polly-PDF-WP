@@ -72,7 +72,6 @@ function polly_pdf_get_available_models() {
 // =============================================================================
 
 add_action( 'admin_menu', function () {
-    // 1. Dedicated PDF Workspace screen
     add_menu_page(
         'Polly PDF Remediation',
         'Polly PDF',
@@ -83,7 +82,6 @@ add_action( 'admin_menu', function () {
         30
     );
 
-    // 2. Settings sub-menu page
     add_submenu_page(
         'polly-pdf-workspace',
         'Polly PDF Settings',
@@ -94,7 +92,6 @@ add_action( 'admin_menu', function () {
     );
 } );
 
-// Action links shortcut on the primary Plugins page row
 add_filter( 'plugin_action_links_' . plugin_basename( POLLY_PDF_PLUGIN_FILE ), function ( $links ) {
     $settings_link = '<a href="' . esc_url( admin_url( 'admin.php?page=polly-pdf-settings' ) ) . '">'
         . __( 'Settings' ) . '</a>';
@@ -140,8 +137,6 @@ add_action( 'admin_init', function () {
             ];
         }
 
-        // --- Dynamic Default Engine (Mirroring Polly Alt) ---
-        // 1. Look for the absolute newest active flash model to mark as recommended
         $recommended_model = '';
         foreach ( array_keys( $models ) as $model_key ) {
             if ( strpos( $model_key, '-flash' ) !== false ) {
@@ -151,18 +146,15 @@ add_action( 'admin_init', function () {
             }
         }
         
-        // 2. Fall back to the first available model if no explicitly named flash model exists
         if ( empty( $recommended_model ) ) {
             $model_keys = array_keys( $models );
             $recommended_model = ! empty( $model_keys ) ? $model_keys[0] : '';
         }
 
-        // 3. Check the database, defaulting to our dynamically calculated recommendation
         $current_model = get_option( 'polly_pdf_model', $recommended_model );
         ?>
         <select name="polly_pdf_model" id="polly-pdf-model" style="min-width: 250px;">
             <?php foreach ( $models as $value => $label ) : 
-                // Dynamically append the label to the live recommended model
                 $display_label = ( $recommended_model === $value ) ? $label . ' (Recommended)' : $label;
                 ?>
                 <option value="<?php echo esc_attr( $value ); ?>" <?php selected( $current_model, $value ); ?>>
@@ -292,660 +284,15 @@ function polly_pdf_workspace_page() {
                 </div>
 
                 <div id="status-bar" style="position: absolute; bottom: 0; left: 0; right: 0; padding: 10px 20px; background: white; border-top: 1px solid #ccd0d4; font-size: 0.85rem; display: flex; justify-content: space-between;">
-                    <span id="status-left">Polly PDF v0.3.0</span>
+                    <span id="status-left">Polly PDF v0.4.0</span>
                     <span id="status-right" style="font-weight: 600;">Idle</span>
                 </div>
             </div>
         </div>
     </div>
-
-    <!-- Consolidated styling variables to guarantee perfect visual presentation -->
-    <style>
-        #drop-zone.hover { background: #f0faff !important; border-color: #00a0d2 !important; transform: scale(1.01); }
-        #drop-zone.has-file { border-style: solid !important; height: auto !important; padding: 40px !important; }
-        .hidden { display: none !important; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .polly-badge-legacy { background: #fff3cd !important; color: #856404 !important; border: 1px solid #ffeeba !important; }
-        .polly-badge-tagged { background: #d4edda !important; color: #155724 !important; border: 1px solid #c3e6cb !important; }
-        .image-card { background: #f6f7f7; border: 1px solid #ccd0d4; border-radius: 8px; margin-bottom: 20px; overflow: hidden; }
-        .image-card img { width: 100%; height: 200px; object-fit: contain; background: #e5e5e5; display: block; }
-        .image-card .badge-untagged { background: #fcf0f1; color: #d63638; border: 1px solid #f1c3c4; }
-        .image-card .badge-queued { background: #fff8e5; color: #856404; border: 1px solid #ffeeba; }
-        .image-card .badge-remediated { background: #ecf7ed; color: #46b450; border: 1px solid #c1e8c5; }
-        .alt-result { margin-top: 10px; padding: 10px; background: #f9f9f9; border-left: 3px solid #0073aa; font-style: italic; word-wrap: break-word; font-size: 0.8rem; }
-        .char-counter { text-align: right; font-size: 0.7rem; color: #999; margin-top: 4px; }
-        .char-counter.over-limit { color: #d63638; font-weight: bold; }
-        .spinner { margin: 0 auto; width: 40px; height: 40px; border: 3px solid #f3f3f3; border-top: 3px solid #0073aa; border-radius: 50%; animation: spin 1s linear infinite; }
-        
-        /* Modal Window & Choice List Layouts */
-        #polly-pdf-modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 9999; }
-        #polly-pdf-modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 650px; background: #white; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.3); z-index: 10000; overflow: hidden; display: flex; flex-direction: column; max-height: 85vh; background: #fff; }
-        .polly-pdf-modal-image-container { height: 220px; background: #ececec; display: flex; align-items: center; justify-content: center; overflow: hidden; border-bottom: 1px solid #e5e5e5; }
-        .polly-pdf-modal-image-container img { max-width: 100%; max-height: 100%; object-fit: contain; }
-        .polly-pdf-modal-header { padding: 15px 20px; background: #f6f7f7; border-bottom: 1px solid #ccd0d4; }
-        .polly-pdf-modal-header h3 { margin: 0; font-size: 1.15rem; color: #1d2327; }
-        .polly-pdf-modal-body { padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
-        .polly-pdf-choice-item { border: 1px solid #ccd0d4; border-radius: 8px; padding: 12px; position: relative; background: #fafafa; display: flex; flex-direction: column; }
-        .polly-pdf-choice-select-btn { text-align: left; background: none; border: none; padding: 0; cursor: pointer; width: 100%; display: block; color: inherit; }
-        .polly-pdf-choice-tag { font-size: 0.65rem; font-weight: bold; background: #e5f5fa; color: #0073aa; padding: 2px 6px; border-radius: 4px; display: inline-block; margin-bottom: 8px; text-transform: uppercase; }
-        .polly-pdf-choice-tag.original { background: #ecf7ed; color: #46b450; }
-        .polly-pdf-choice-content { font-size: 0.85rem; line-height: 1.4; color: #1d2327; margin-bottom: 8px; font-style: italic; }
-        .polly-pdf-choice-char-count { font-size: 0.7rem; color: #72777c; align-self: flex-end; }
-        .polly-pdf-choice-char-count.over-limit { color: #d63638; font-weight: bold; }
-        .polly-pdf-choice-explanation { font-size: 0.75rem; color: #646970; border-top: 1px dashed #ccd0d4; margin-top: 8px; padding-top: 8px; }
-        .polly-pdf-modal-edit-btn { position: absolute; top: 12px; right: 12px; background: #f6f7f7; border: 1px solid #ccd0d4; padding: 4px 10px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; cursor: pointer; color: #0073aa; }
-        .polly-pdf-modal-edit-btn:hover { background: #fff; border-color: #0073aa; }
-        .polly-pdf-choice-textarea { width: 100%; margin-top: 10px; font-size: 0.8rem; padding: 8px; box-sizing: border-box; border: 1px solid #0073aa; border-radius: 4px; }
-        .polly-pdf-modal-footer-btn { background: #f6f7f7; border: 1px solid #ccd0d4; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; text-align: center; color: #50575e; width: 100%; margin-top: 10px; }
-        .polly-pdf-modal-footer-btn:hover { background: #fff; color: #1d2327; border-color: #8c8f94; }
-    </style>
-
-    <!-- Enqueue JS Handlers & pdf-lib Injected Directly into Dashboard -->
-    <script>
-        (function() {
-            // Self-healing initialisation checker: Waits for external CDN libraries to be fully initialized 
-            // on the window namespace before firing our workspace logic to prevent race crashes.
-            function initPolly() {
-                if (typeof PDFLib === 'undefined' || typeof window['pdfjs-dist/build/pdf'] === 'undefined') {
-                    setTimeout(initPolly, 40);
-                    return;
-                }
-                startPolly();
-            }
-
-            function startPolly() {
-                const config = {
-                    model: '<?php echo esc_js( get_option( "polly_pdf_model", "gemini-2.0-flash" ) ); ?>',
-                    serverUrl: '<?php echo esc_js( get_option( "polly_pdf_server_url", "http://localhost:5001" ) ); ?>',
-                    choiceCount: <?php echo intval( get_option( 'polly_pdf_choice_count', 3 ) ); ?>,
-                    ajaxUrl: '<?php echo esc_js( admin_url( "admin-ajax.php" ) ); ?>',
-                    nonce: '<?php echo esc_js( wp_create_nonce( "polly_pdf_nonce" ) ); ?>'
-                };
-
-                const { PDFDocument, PDFName } = PDFLib;
-                const pdfjsLib = window['pdfjs-dist/build/pdf'];
-                pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-
-                // DOM
-                const dropZone = document.getElementById('drop-zone');
-                const idleView = document.getElementById('idle-view');
-                const loadingView = document.getElementById('loading-view');
-                const loadingTitle = document.getElementById('loading-title');
-                const loadingSub = document.getElementById('loading-sub');
-                const readyView = document.getElementById('ready-view');
-                const readySub = document.getElementById('ready-sub');
-                const downloadBtn = document.getElementById('download-btn');
-                const docTypeBadge = document.getElementById('doc-type-badge');
-                const imageList = document.getElementById('image-list');
-                const imageCountLabel = document.getElementById('image-count');
-                const statusRight = document.getElementById('status-right');
-
-                // State
-                let remediationQueue = [];
-                let isProcessingQueue = false;
-                let remediatedCount = 0;
-                let currentPdfFile = null; 
-                let currentFileName = "";
-                let remediationResults = {};
-
-                // Global Window Interceptors: Prevents the browser from ever opening dragged PDFs globally 
-                // if the cursor accidentally slips outside the bounds of the drop container zone!
-                window.addEventListener('dragover', (e) => e.preventDefault(), false);
-                window.addEventListener('drop', (e) => e.preventDefault(), false);
-
-                // Drag & Drop
-                dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add('hover'); };
-                dropZone.ondragleave = () => dropZone.classList.remove('hover');
-                dropZone.ondrop = async (e) => {
-                    e.preventDefault();
-                    dropZone.classList.remove('hover');
-                    const file = e.dataTransfer.files[0];
-                    if (file?.type === "application/pdf") {
-                        currentPdfFile = file;
-                        currentFileName = file.name.replace(".pdf", "-remediated.pdf");
-                        processPDF(file);
-                    }
-                };
-
-                async function processPDF(file) {
-                    idleView.classList.add('hidden');
-                    readyView.classList.add('hidden');
-                    loadingView.classList.remove('hidden');
-                    imageList.innerHTML = "";
-                    remediatedCount = 0;
-                    remediationResults = {};
-
-                    try {
-                        const arrayBuffer = await file.arrayBuffer();
-
-                        // Ask Python for image metadata including any existing alt text
-                        const inspectForm = new FormData();
-                        inspectForm.append('pdf', file);
-                        let inspectData = { pages: {} };
-                        try {
-                            const inspectResp = await fetch(`${config.serverUrl}/inspect`, {
-                                method: 'POST',
-                                body: inspectForm
-                            });
-                            if (inspectResp.ok) {
-                                inspectData = await inspectResp.json();
-                                console.log('Inspect data:', JSON.stringify(inspectData, null, 2));
-                            }
-                        } catch(e) {
-                            console.warn('Could not reach inspect endpoint:', e);
-                        }
-                        
-                        // Check Structure Root via PDF-lib
-                        const pdfDocCheck = await PDFDocument.load(arrayBuffer.slice(0));
-                        const isTagged = !!pdfDocCheck.catalog.get(PDFName.of('StructTreeRoot'));
-
-                        if (isTagged) {
-                            docTypeBadge.innerText = "Tagged PDF Structure Detected";
-                            docTypeBadge.className = "badge polly-badge-tagged";
-                        } else {
-                            docTypeBadge.innerText = "Legacy/Untagged Document Detected";
-                            docTypeBadge.className = "badge polly-badge-legacy";
-                        }
-
-                        const loadingTask = pdfjsLib.getDocument({
-                            data: arrayBuffer.slice(0),
-                            disableAutoFetch: true,
-                            disableStream: true
-                        });
-                        const pdf = await loadingTask.promise;
-                        let foundCount = 0;
-                        let pageCounts = {};
-
-                        for (let i = 1; i <= pdf.numPages; i++) {
-                            loadingSub.innerText = `Scanning Page ${i} of ${pdf.numPages}...`;
-                            const page = await pdf.getPage(i);
-                            const operatorList = await page.getOperatorList();
-                            
-                            for (let j = 0; j < operatorList.fnArray.length; j++) {
-                                if (operatorList.fnArray[j] === pdfjsLib.OPS.paintImageXObject || 
-                                    operatorList.fnArray[j] === pdfjsLib.OPS.paintJpegXObject) {
-                                    
-                                    const imgName = operatorList.argsArray[j][0];
-                                    const imgObj = await new Promise(r => page.objs.get(imgName, r));
-                                    if (imgObj) {
-                                        const pageIdx = i - 1;
-                                        const pageImages = (inspectData && inspectData.pages) ? (inspectData.pages[String(pageIdx)] || []) : [];
-                                        
-                                        let pageImgIndex;
-                                        const nameMatch = imgName.match(/img_p\d+_(\d+)/);
-                                        if (nameMatch) {
-                                            pageImgIndex = parseInt(nameMatch[1]) - 1; // convert to 0-based
-                                        } else {
-                                            pageImgIndex = pageCounts[pageIdx] || 0;
-                                        }
-                                        pageCounts[pageIdx] = (pageCounts[pageIdx] || 0) + 1;
-                                        const imgMeta = pageImages[pageImgIndex] || null;
-                                        console.log(`Page ${pageIdx} imgName="${imgName}" pageImgIndex=${pageImgIndex} imgMeta=`, imgMeta);
-                                        const existingAlt = imgMeta ? (imgMeta.existingAlt || '') : '';
-                                        foundCount++;
-                                        renderImageToGallery(imgObj, i, foundCount, pageIdx, imgName, existingAlt, pageImgIndex);
-                                    }
-                                }
-                            }
-                        }
-
-                        loadingView.classList.add('hidden');
-                        readyView.classList.remove('hidden');
-                        dropZone.classList.add('has-file');
-                        imageCountLabel.innerText = `${foundCount} Assets Identified`;
-                        updateDownloadButton();
-                        statusRight.innerText = "Scanning complete";
-                    } catch (err) {
-                        console.error(err);
-                        loadingTitle.innerText = "Scanning Failed";
-                        loadingView.classList.remove('hidden');
-                    }
-                }
-
-                function renderImageToGallery(imgObj, pageNum, index, pageIdx, imgName, existingAlt = '', pageImgIndex = 0) {
-                    const canvas = document.createElement('canvas');
-                    canvas.width = imgObj.width; canvas.height = imgObj.height;
-                    const ctx = canvas.getContext('2d');
-                    try {
-                        if (imgObj.bitmap) ctx.drawImage(imgObj.bitmap, 0, 0);
-                        else {
-                            const totalPixels = imgObj.width * imgObj.height;
-                            const rgbaData = imgObj.data.length === totalPixels * 3 ? new Uint8ClampedArray(totalPixels * 4) : imgObj.data;
-                            if (imgObj.data.length === totalPixels * 3) {
-                                for (let i = 0, j = 0; i < imgObj.data.length; i += 3, j += 4) {
-                                    rgbaData[j] = imgObj.data[i]; rgbaData[j+1] = imgObj.data[i+1];
-                                    rgbaData[j+2] = imgObj.data[i+2]; rgbaData[j+3] = 255;
-                                }
-                            }
-                            ctx.putImageData(new ImageData(rgbaData, imgObj.width, imgObj.height), 0, 0);
-                        }
-                        const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-                        const alreadyTagged = existingAlt.length > 0;
-                        const card = document.createElement('div');
-                        card.className = 'image-card';
-                        card.id = `img-card-${index}`;
-                        card.style.padding = '12px';
-                        card.style.background = '#fff';
-                        card.innerHTML = `
-                            <img src="${dataUrl}">
-                            <div class="image-info" style="margin-top: 10px; font-size: 0.8rem;">
-                                <span class="badge ${alreadyTagged ? 'badge-remediated' : 'badge-untagged'}" id="badge-${index}" style="display: inline-block; padding: 2px 6px; border-radius: 4px; font-weight: bold; text-transform: uppercase; font-size: 0.65rem; margin-bottom: 8px;">${alreadyTagged ? 'Already Tagged' : 'Untagged'}</span>
-                                <div><strong>Asset #${index}</strong> (Page ${pageNum})</div>
-                                <div id="content-${index}">
-                                    <textarea
-                                        id="alt-text-${index}"
-                                        rows="3"
-                                        style="width:100%; margin-top:10px; font-size:0.8rem; padding:6px; box-sizing:border-box; border:1px solid #ccc; border-radius:4px;"
-                                        placeholder="Alt text will appear here — edit before downloading..."
-                                    >${existingAlt}</textarea>
-                                    <button class="button button-secondary" id="btn-${index}" style="width: 100%; margin-top: 8px; font-weight: bold;" onclick="window.addToQueue(${index}, '${dataUrl.split(',')[1]}', ${pageIdx}, '${imgName}')">
-                                        ${alreadyTagged ? 'Preview & Refine' : 'Preview & Generate'}
-                                    </button>
-                                    ${alreadyTagged ? `<div style="margin-top:6px; font-size:0.7rem; color:#666;">Alt text found in document. Edit above or regenerate.</div>` : ''}
-                                </div>
-                            </div>
-                        `;
-                        imageList.appendChild(card);
-                        // Store metadata at render time so download works for pre-tagged images
-                        remediationResults[index] = {
-                            pageIdx: pageIdx,
-                            imgIdx: pageImgIndex,
-                            imgName: imgName,
-                            alt: existingAlt
-                        };
-                        // Enable download button as soon as any textarea has content
-                        const textarea = document.getElementById(`alt-text-${index}`);
-                        if (textarea) {
-                            textarea.addEventListener('input', updateDownloadButton);
-                        }
-                    } catch(e) { console.error('renderImageToGallery error:', e); }
-                }
-
-                // Focus trapping for modal accessibility
-                function trapFocus(modal) {
-                    const focusable = modal.querySelectorAll(
-                        'a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])'
-                    );
-                    const first = focusable[0];
-                    const last = focusable[focusable.length - 1];
-                    modal.addEventListener('keydown', function(e) {
-                        if (e.key === 'Escape') {
-                            modal.dispatchEvent(new Event('polly-close'));
-                            return;
-                        }
-                        if (e.key !== 'Tab') return;
-                        if (e.shiftKey) {
-                            if (document.activeElement === first) {
-                                e.preventDefault();
-                                last.focus();
-                            }
-                        } else {
-                            if (document.activeElement === last) {
-                                e.preventDefault();
-                                first.focus();
-                            }
-                        }
-                    });
-                }
-
-                function showChoiceModal(choices, existingAlt, imgDataUrl, triggerBtn, onSelect) {
-                    document.getElementById('polly-pdf-modal-overlay')?.remove();
-                    document.getElementById('polly-pdf-modal')?.remove();
-
-                    const overlay = document.createElement('div');
-                    overlay.id = 'polly-pdf-modal-overlay';
-
-                    const modal = document.createElement('div');
-                    modal.id = 'polly-pdf-modal';
-                    modal.setAttribute('role', 'dialog');
-                    modal.setAttribute('aria-modal', 'true');
-                    modal.setAttribute('aria-label', 'Choose Alt Text');
-
-                    modal.innerHTML = `
-                        <div class="polly-pdf-modal-image-container">
-                            <img src="${imgDataUrl}" alt="">
-                        </div>
-                        <div class="polly-pdf-modal-header"><h3>🦜 Choose Alt Text</h3></div>
-                        <div class="polly-pdf-modal-body"></div>
-                    `;
-
-                    // Centre the image vertically in its container once loaded
-                    const imgContainer = modal.querySelector('.polly-pdf-modal-image-container');
-                    const img = imgContainer.querySelector('img');
-                    img.onload = () => {
-                        imgContainer.scrollTop = (imgContainer.scrollHeight - imgContainer.clientHeight) / 2;
-                    };
-                    if (img.complete) {
-                        imgContainer.scrollTop = (imgContainer.scrollHeight - imgContainer.clientHeight) / 2;
-                    }
-
-                    const body = modal.querySelector('.polly-pdf-modal-body');
-
-                    // Build options list — existing alt first if present, then AI choices
-                    const options = [];
-                    if (existingAlt) {
-                        options.push({ alt: existingAlt, focus: 'Current text', explanation: null, isOriginal: true });
-                    }
-                    choices.forEach(c => options.push({ ...c, isOriginal: false }));
-
-                    options.forEach(opt => {
-                        const item = document.createElement('div');
-                        item.className = 'polly-pdf-choice-item';
-
-                        const selectBtn = document.createElement('button');
-                        selectBtn.type = 'button';
-                        selectBtn.className = 'polly-pdf-choice-select-btn';
-                        selectBtn.setAttribute('aria-label', `Select: ${opt.alt}`);
-
-                        const tag = document.createElement('span');
-                        tag.className = 'polly-pdf-choice-tag' + (opt.isOriginal ? ' original' : '');
-                        tag.textContent = opt.isOriginal ? 'CURRENT TEXT' : (opt.focus || 'AI OPTION');
-
-                        const content = document.createElement('div');
-                        content.className = 'polly-pdf-choice-content';
-                        content.textContent = opt.alt;
-
-                        const charCount = document.createElement('span');
-                        charCount.className = 'polly-pdf-choice-char-count' + (opt.alt.length > 125 ? ' over-limit' : '');
-                        charCount.textContent = `${opt.alt.length} / 125 characters`;
-
-                        selectBtn.appendChild(tag);
-                        selectBtn.appendChild(content);
-                        selectBtn.appendChild(charCount);
-
-                        if (opt.explanation) {
-                            const expl = document.createElement('div');
-                            expl.className = 'polly-pdf-choice-explanation';
-                            expl.textContent = opt.explanation;
-                            selectBtn.appendChild(expl);
-                        }
-
-                        item.appendChild(selectBtn);
-
-                        // Edit button
-                        const editBtn = document.createElement('button');
-                        editBtn.type = 'button';
-                        editBtn.className = 'polly-pdf-modal-edit-btn';
-                        editBtn.textContent = 'Edit';
-                        editBtn.dataset.state = 'edit';
-                        item.appendChild(editBtn);
-
-                        selectBtn.onclick = () => {
-                            const textarea = item.querySelector('.polly-pdf-choice-textarea');
-                            const finalVal = textarea ? textarea.value : content.textContent;
-                            onSelect(finalVal);
-                            cleanup();
-                        };
-
-                        editBtn.onclick = (e) => {
-                            e.stopPropagation();
-                            if (editBtn.dataset.state === 'edit') {
-                                const ta = document.createElement('textarea');
-                                ta.className = 'polly-pdf-choice-textarea';
-                                ta.value = content.textContent;
-                                item.appendChild(ta);
-                                editBtn.textContent = 'Apply';
-                                editBtn.dataset.state = 'apply';
-                                ta.addEventListener('input', () => {
-                                    charCount.textContent = `${ta.value.length} / 125 characters`;
-                                    charCount.className = 'polly-pdf-choice-char-count' + (ta.value.length > 125 ? ' over-limit' : '');
-                                });
-                                ta.addEventListener('click', e => e.stopPropagation());
-                                ta.focus();
-                            } else {
-                                selectBtn.click();
-                            }
-                        };
-
-                        body.appendChild(item);
-                    });
-
-                    // Decorative / Artifact option
-                    const decoWrap = document.createElement('div');
-                    decoWrap.style.cssText = 'margin-top:8px; padding:12px; background:#f9f9f9; border:1px solid #ddd; border-radius:6px;';
-                    const decoId = `polly-pdf-deco-${Date.now()}`;
-                    decoWrap.innerHTML = `
-                        <label for="${decoId}" style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.85rem; font-weight:600; color:#333;">
-                            <input type="checkbox" id="${decoId}" style="margin-top:2px; transform:scale(1.1);">
-                            Decorative
-                        </label>
-                        <span style="display:block; margin-top:6px; font-size:0.75rem; color:#666; font-style:italic; line-height:1.4;">Blind and low-vision users don't need a description of this image. Marking it as a Decorative Artifact will instruct screen readers to skip it entirely.</span>
-                    `;
-                    body.appendChild(decoWrap);
-
-                    const decoCheck = decoWrap.querySelector('input[type="checkbox"]');
-                    decoCheck.addEventListener('change', () => {
-                        if (decoCheck.checked) {
-                            onSelect('', true); // empty alt, decorative=true
-                            cleanup();
-                        }
-                    });
-                    // Cancel button
-                    const cancelBtn = document.createElement('button');
-                    cancelBtn.type = 'button';
-                    cancelBtn.className = 'polly-pdf-modal-footer-btn';
-                    cancelBtn.textContent = 'Keep Current & Close';
-                    cancelBtn.onclick = cleanup;
-                    body.appendChild(cancelBtn);
-
-                    const trigger = triggerBtn || document.activeElement;
-
-                    function cleanup() {
-                        overlay.remove();
-                        modal.remove();
-                        if (trigger) trigger.focus();
-                    }
-
-                    modal.addEventListener('polly-close', cleanup);
-                    overlay.onclick = cleanup;
-
-                    document.body.appendChild(overlay);
-                    document.body.appendChild(modal);
-
-                    modal.setAttribute('tabindex', '-1');
-                    modal.focus();
-
-                    const firstChoice = body.querySelector('.polly-pdf-choice-select-btn');
-                    if (firstChoice) firstChoice.focus({ focusVisible: true });
-
-                    trapFocus(modal);
-                }
-
-                window.addToQueue = function(index, base64, pageIdx, imgName) {
-                    const badge = document.getElementById(`badge-${index}`);
-                    const btn = document.getElementById(`btn-${index}`);
-                    const container = document.getElementById(`content-${index}`);
-                    badge.className = "badge badge-queued";
-                    badge.innerText = "Queued";
-                    if (btn) { btn.disabled = true; btn.innerText = "Queued..."; }
-                    remediationQueue.push({ index, base64, container, badge, pageIdx, imgName });
-                    processQueue();
-                }
-
-                async function processQueue() {
-                    if (isProcessingQueue || remediationQueue.length === 0) return;
-                    isProcessingQueue = true;
-                    const task = remediationQueue.shift();
-                    
-                    task.container.innerHTML = `<div style="display:flex; align-items:center; gap:10px; margin-top:10px;"><div class="spinner" style="width: 18px; height: 18px; border: 2px solid #f3f3f3; border-top: 2px solid #0073aa; border-radius: 50%; animation: spin 1s linear infinite;"></div><span id="polly-feedback-${task.index}">Pacing request...</span></div>`;
-                    await new Promise(r => setTimeout(r, 2500)); 
-
-                    task.container.innerHTML = `<div style="display:flex; align-items:center; gap:10px; margin-top:10px;"><div class="spinner" style="width: 18px; height: 18px; border: 2px solid #f3f3f3; border-top: 2px solid #0073aa; border-radius: 50%; animation: spin 1s linear infinite;"></div><span id="polly-feedback-${task.index}">Analyzing...</span></div>`;
-                    try {
-                        await runRemediation(task);
-                    } catch (err) {
-                        task.container.innerHTML = `<p style="color:#d63638; font-size:0.75rem;">Failed: ${err.message}</p><button class="button button-primary" onclick="window.addToQueue(${task.index}, '${task.base64}', ${task.pageIdx}, '${task.imgName}')">Retry</button>`;
-                    }
-                    isProcessingQueue = false;
-                    setTimeout(processQueue, 500);
-                }
-
-                async function runRemediation(task, retryCount = 0) {
-                    const prompt = `Task: Generate exactly ${config.choiceCount} distinct alt text variations for this image. Each must foreground a DIFFERENT visible subject or element as its opening focus. HARD CONSTRAINT: Each 'alt' value MUST NOT exceed 125 characters. Format: JSON array ONLY — no markdown, no preamble. Schema: [{"alt": "...", "focus": "short noun phrase naming the visual element", "explanation": "one sentence max"}, ...]`;
-
-                    const payload = JSON.stringify({
-                        contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: "image/jpeg", data: task.base64 } }] }],
-                        generationConfig: { responseMimeType: 'application/json' }
-                    });
-
-                    const formData = new FormData();
-                    formData.append('action', 'polly_pdf_proxy');
-                    formData.append('nonce', config.nonce);
-                    formData.append('model', config.model);
-                    formData.append('payload', payload);
-
-                    const response = await fetch(config.ajaxUrl, {
-                        method: 'POST',
-                        body: formData
-                    });
-
-                    const resultData = await response.json();
-                    if (!resultData.success) {
-                        if (response.status === 429 && retryCount < 4) {
-                            const waitTime = Math.pow(2, retryCount) * 5000;
-                            const feedbackEl = document.getElementById(`polly-feedback-${task.index}`);
-                        if (feedbackEl) feedbackEl.innerText = `Cooldown (${waitTime/1000}s)...`;
-                            await new Promise(r => setTimeout(r, waitTime));
-                            return runRemediation(task, retryCount + 1);
-                        }
-                        throw new Error(resultData.data?.message || "Secure proxy error.");
-                    }
-
-                    const responsePayload = resultData.data;
-                    const rawText = responsePayload.candidates[0].content.parts[0].text
-                        .replace(/```json/g, '').replace(/```/g, '').trim();
-                    const choices = JSON.parse(rawText);
-
-                    // Restore the card UI before showing modal
-                    // so the user can see the image card behind the modal
-                    const currentAlt = document.getElementById(`alt-text-${task.index}`)?.value || '';
-                    const imgDataUrl = `data:image/jpeg;base64,${task.base64}`;
-                    const triggerBtn = document.getElementById(`btn-${task.index}`);
-
-                    // Re-enable the button so it can be refocused after modal closes
-                    if (triggerBtn) {
-                        triggerBtn.disabled = false;
-                        const hasBadge = task.container.closest('.image-card')?.querySelector('.badge-remediated');
-                        triggerBtn.innerText = hasBadge ? 'Preview & Refine' : 'Preview & Generate';
-                    }
-
-                    // Restore spinner-replaced container back to textarea
-                    task.container.innerHTML = `
-                        <textarea
-                            id="alt-text-${task.index}"
-                            rows="3"
-                            style="width:100%; margin-top:10px; font-size:0.8rem; padding:6px; box-sizing:border-box; border:1px solid #ccc; border-radius:4px;"
-                        >${currentAlt}</textarea>
-                        <button class="button button-secondary" id="btn-${task.index}" style="width: 100%; margin-top: 8px; font-weight: bold;" onclick="window.addToQueue(${task.index}, '${task.base64}', ${task.pageIdx}, '${task.imgName}')">
-                            Preview & Refine
-                        </button>
-                    `;
-
-                    showChoiceModal(
-                        choices,
-                        currentAlt,
-                        imgDataUrl,
-                        document.getElementById(`btn-${task.index}`),
-                        (selectedText, isDecorative = false) => {
-                            const ta = document.getElementById(`alt-text-${task.index}`);
-                            if (ta) {
-                                ta.value = selectedText;
-                                ta.dispatchEvent(new Event('input'));
-                            }
-                            // Update badge
-                            task.badge.className = `badge ${isDecorative ? 'badge-artifact' : 'badge-remediated'}`;
-                            task.badge.innerText = isDecorative ? 'Decorative Artifact' : 'Remediated';
-                            // Store decorative flag in metadata
-                            remediationResults[task.index] = {
-                                ...remediationResults[task.index],
-                                decorative: isDecorative
-                            };
-                            if (!isDecorative) {
-                                remediatedCount++;
-                            }
-                            updateDownloadButton();
-                        }
-                    );
-                }
-
-                function updateDownloadButton() {
-                    // Count textareas that have non-empty content
-                    const filledCount = Array.from(
-                        document.querySelectorAll('textarea[id^="alt-text-"]')
-                    ).filter(t => t.value.trim().length > 0).length;
-
-                    readySub.innerText = `${filledCount} asset${filledCount !== 1 ? 's' : ''} ready to download.`;
-                    downloadBtn.disabled = filledCount === 0;
-                }
-
-                // Post compiled remediation payload to our python serverless backend
-                downloadBtn.onclick = async () => {
-                    statusRight.innerText = "Transmitting to engine...";
-                    downloadBtn.disabled = true;
-
-                    try {
-                        // Clean up our remediation results metadata map to make sure it includes the asset names
-                        const formattedMetadata = {};
-                        document.querySelectorAll('textarea[id^="alt-text-"]').forEach(textarea => {
-                            const idx = textarea.id.replace('alt-text-', '');
-                            const altText = textarea.value.trim();
-                            const isDecorative = remediationResults[idx]?.decorative || false;
-                            // Include if has alt text OR explicitly marked decorative
-                            if (!altText && !isDecorative) return;
-                            if (remediationResults[idx]) {
-                                formattedMetadata[idx] = {
-                                    alt: altText,
-                                    pageIdx: remediationResults[idx].pageIdx,
-                                    imgName: remediationResults[idx].imgName,
-                                    imgIdx: remediationResults[idx].imgIdx,
-                                    decorative: isDecorative
-                                };
-                            }
-                        });
-
-                        const formPayload = new FormData();
-                        formPayload.append('pdf', currentPdfFile);
-                        formPayload.append('metadata', JSON.stringify(formattedMetadata));
-
-                        const remoteResponse = await fetch(`${config.serverUrl}/remediate`, {
-                            method: 'POST',
-                            body: formPayload
-                        });
-
-                        if (!remoteResponse.ok) {
-                            const errorJson = await remoteResponse.json();
-                            throw new Error(errorJson.error || "Compiler service returned error state.");
-                        }
-
-                        const pdfBlob = await remoteResponse.blob();
-                        const url = window.URL.createObjectURL(pdfBlob);
-                        const link = document.createElement('a');
-                        link.href = url;
-                        link.download = currentFileName;
-                        document.body.appendChild(link);
-                        link.click();
-                        link.remove();
-                        window.URL.revokeObjectURL(url);
-
-                        statusRight.innerText = "File fully compiled & saved!";
-                    } catch(err) {
-                        console.error("Compile Service Fail", err);
-                        alert("Compilation failed. Ensure your local Python microserver is running at: " + config.serverUrl + "\n\nError: " + err.message);
-                        statusRight.innerText = "Compile Fail";
-                    } finally {
-                        downloadBtn.disabled = false;
-                    }
-                };
-            }
-
-            // Fire safe initializer loop
-            initPolly();
-        })();
-    </script>
     <?php
 }
 
-// Enqueue dependencies for our PDF dashboard screen
 add_action( 'admin_enqueue_scripts', function ( $hook ) {
     if ( 'toplevel_page_polly-pdf-workspace' !== $hook ) return;
 
@@ -971,4 +318,20 @@ add_action( 'admin_enqueue_scripts', function ( $hook ) {
         null,
         false
     );
+
+    wp_enqueue_script(
+        'polly-pdf-logic',
+        plugin_dir_url( POLLY_PDF_PLUGIN_FILE ) . 'polly-pdf.js',
+        [],
+        POLLY_PDF_VERSION,
+        true
+    );
+
+    wp_localize_script( 'polly-pdf-logic', 'pollyPdfConfig', [
+        'model'       => get_option( 'polly_pdf_model', 'gemini-2.0-flash' ),
+        'serverUrl'   => get_option( 'polly_pdf_server_url', 'http://localhost:5001' ),
+        'choiceCount' => intval( get_option( 'polly_pdf_choice_count', 3 ) ),
+        'ajaxUrl'     => admin_url( 'admin-ajax.php' ),
+        'nonce'       => wp_create_nonce( 'polly_pdf_nonce' )
+    ] );
 } );
