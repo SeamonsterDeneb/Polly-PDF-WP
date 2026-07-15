@@ -324,6 +324,49 @@ def rewrite_content_stream_by_name_or_index(
     return True
 
 
+def rewrite_content_stream_for_text_blocks(
+    doc: fitz.Document, page_num: int, first_mcid: int
+) -> list[int]:
+    """
+    Wraps every top-level BT...ET text object in the page's content stream
+    in its own /P << /MCID n >> BDC ... EMC pair, in the order the blocks
+    appear in the stream. Assigns sequential MCIDs starting at first_mcid.
+
+    NOTE: this assumes BT...ET blocks appear in the content stream in the
+    same order get_text_blocks_in_order() reports visually — true for the
+    single-column documents we've tested so far. Multi-column layouts may
+    need smarter matching later (tracked as a follow-up).
+    """
+    page = doc[page_num]
+    content = page.read_contents().decode("latin-1")
+
+    bt_et_matches = list(re.finditer(r'BT.*?ET', content, re.DOTALL))
+    print(
+        f"🦜 [Polly Core] rewrite_content_stream_for_text_blocks: page={page_num} "
+        f"found {len(bt_et_matches)} BT..ET block(s), starting mcid={first_mcid}"
+    )
+
+    if not bt_et_matches:
+        return []
+
+    assigned_mcids = []
+    new_content = ""
+    cursor = 0
+    for i, m in enumerate(bt_et_matches):
+        mcid = first_mcid + i
+        assigned_mcids.append(mcid)
+        new_content += content[cursor:m.start()]
+        new_content += f"/P << /MCID {mcid} >>BDC\n{m.group(0)}\nEMC\n"
+        cursor = m.end()
+    new_content += content[cursor:]
+
+    contents_xref = _get_contents_xref(doc, page_num)
+    print(f"🦜 [Polly Core] text block content rewrite: new length={len(new_content)}")
+    doc.update_stream(contents_xref, new_content.encode("latin-1"), compress=False)
+
+    return assigned_mcids
+
+
 def create_figure_struct_element(
     doc: fitz.Document, page_xref: int, mcid: int, alt_text: str, page_num: int, img_index: int
 ) -> int:
@@ -373,12 +416,28 @@ def create_figure_struct_element(
     return fig_xref
 
 
-def append_to_document_struct_k(doc: fitz.Document, new_xref: int, page_xref: int) -> None:
+def create_text_struct_element(
+    doc: fitz.Document, page_xref: int, mcid: int, doc_struct_xref: int
+) -> int:
     """
-    Insert the new struct element into the StructTreeRoot /K array at the correct
-    reading-order position — after the last existing element on the same page,
-    rather than blindly appending at the end.
+    Creates a minimal /P struct element for a tagged text block.
+    Unlike Figure elements, /P elements don't need /Alt or a /Layout bbox
+    attribute — the actual text content lives in the content stream itself,
+    the struct element just needs to point back at the right MCID and page.
     """
+    p_xref = doc.get_new_xref()
+    struct_obj = (
+        f"<</S /P "
+        f"/K {mcid} "
+        f"/P {doc_struct_xref} 0 R "
+        f"/Pg {page_xref} 0 R >>"
+    )
+    doc.update_object(p_xref, struct_obj)
+    return p_xref
+
+
+def append_to_document_struct_k(doc: fitz.Document, new_xref: int) -> None:
+    """Add the new struct element xref to the appropriate /K array."""
     target_xref = _get_document_struct_xref(doc)
     target_obj = doc.xref_object(target_xref)
 
@@ -619,6 +678,56 @@ def _get_image_resource_name(doc: fitz.Document, page_num: int, img_xref: int) -
                 return name
     return ""
 
+def get_text_blocks_in_order(doc: fitz.Document, page_num: int) -> list[dict]:
+    """
+    Extract all text LINES on a page via PyMuPDF's text dict and return them
+    in a naive single-column reading order (top-to-bottom, then left-to-right
+    for lines that land in roughly the same row).
+
+    IMPORTANT: this operates at LINE granularity, not paragraph/block
+    granularity, because PDF content streams typically open a new BT...ET
+    text object per line rather than per paragraph. Matching granularity
+    1:1 with rewrite_content_stream_for_text_blocks() is what lets each
+    wrapped MCID map back to a real struct element instead of being orphaned.
+
+    This does NOT touch the content stream — it's a read-only inventory step.
+
+    Column detection is NOT handled here yet — multi-column layouts will sort
+    incorrectly until that's added as a follow-up.
+    """
+    page = doc[page_num]
+    raw = page.get_text("dict")
+
+    lines = []
+    for b in raw.get("blocks", []):
+        if b.get("type") != 0:
+            continue  # type 1 = image block; images are handled by the existing Figure pipeline
+
+        for line in b.get("lines", []):
+            text = "".join(span["text"] for span in line.get("spans", []))
+            if not text.strip():
+                continue
+            x0, y0, x1, y1 = line["bbox"]
+            lines.append({"bbox": (x0, y0, x1, y1), "text": text})
+
+    # Naive reading order: round y0 into "rows" so lines that are visually
+    # side-by-side don't get separated purely by sub-pixel y differences,
+    # then sort by x0 within a row. ROW_TOLERANCE may need tuning per-document.
+    ROW_TOLERANCE = 3.0
+    lines.sort(key=lambda ln: (round(ln["bbox"][1] / ROW_TOLERANCE), ln["bbox"][0]))
+
+    for i, ln in enumerate(lines):
+        ln["order_index"] = i
+
+    print(f"🦜 [Polly Core] page {page_num+1}: found {len(lines)} text line(s)")
+    for ln in lines:
+        preview = ln["text"].strip().replace("\n", " ")[:60]
+        print(
+            f"🦜 [Polly Core]   [{ln['order_index']}] "
+            f"y0={ln['bbox'][1]:.1f} x0={ln['bbox'][0]:.1f} — {preview!r}"
+        )
+
+    return lines
 
 def _ensure_struct_tree(doc: fitz.Document) -> None:
     cat_xref = doc.pdf_catalog()
@@ -683,8 +792,9 @@ def _ensure_struct_tree(doc: fitz.Document) -> None:
 def inject_alt_untagged(doc: fitz.Document, page_num: int, img_index: int, alt_text: str) -> str:
     """
     For untagged PDFs: build a minimal struct tree if absent, then inject
-    a /Figure element with /Alt for the target image.
-    Falls back to a safe no-op rather than corrupting the image stream.
+    a /Figure element with /Alt for the target image AND /P elements for
+    every text block on the page, wired into the struct tree in visual
+    top-to-bottom reading order.
     """
     page = doc[page_num]
     images = page.get_images(full=True)
@@ -702,30 +812,76 @@ def inject_alt_untagged(doc: fitz.Document, page_num: int, img_index: int, alt_t
     # Ensure the document has a struct tree scaffold
     _ensure_struct_tree(doc)
 
-    # Assign a new MCID for this image
-    mcid = get_struct_tree_next_key(doc)
+    page_xref = page.xref
+    doc_struct_xref = _get_document_struct_xref(doc)
 
-    # Wrap the image draw command in a Figure BDC/EMC in the content stream
+    # Get the image's bbox so we can sort it against text blocks by position
+    try:
+        img_infos = page.get_image_info(hashes=False)
+        raster_infos = [i for i in img_infos if i.get('width', 0) > 1]
+        img_bbox = raster_infos[img_index]['bbox'] if img_index < len(raster_infos) else (0, 0, 612, 792)
+    except Exception:
+        img_bbox = (0, 0, 612, 792)
+    img_y0 = img_bbox[1]
+
+    # Inventory the text blocks on this page in naive reading order
+    text_blocks = get_text_blocks_in_order(doc, page_num)
+
+    # Assign an MCID + wrap the image draw command in a Figure BDC/EMC
+    img_mcid = get_struct_tree_next_key(doc)
     rewrite_content_stream_by_name_or_index(
         doc, page_num, img_index,
         _get_image_resource_name(doc, page_num, img_xref),
-        mcid
+        img_mcid
     )
-
-    # Create the Figure struct element
-    page_xref = page.xref
     fig_xref = create_figure_struct_element(
-        doc, page_xref, mcid, alt_text, page_num, img_index
+        doc, page_xref, img_mcid, alt_text, page_num, img_index
     )
 
-    # Wire it into the struct tree
-    append_to_document_struct_k(doc, fig_xref)
-    update_parent_tree(doc, mcid, fig_xref)
-    increment_parent_tree_next_key(doc, mcid)
+    # Assign MCIDs + wrap every BT...ET text object on this page.
+    # IMPORTANT: start right after img_mcid rather than re-querying
+    # get_struct_tree_next_key() again — that key isn't bumped until
+    # increment_parent_tree_next_key() runs at the end of this function,
+    # so a second call here would just return the same stale value and
+    # collide with img_mcid.
+    text_start_mcid = img_mcid + 1
+    text_mcids = rewrite_content_stream_for_text_blocks(doc, page_num, text_start_mcid)
+
+    if len(text_mcids) != len(text_blocks):
+        print(
+            f"🦜 [Polly Core] ⚠️ page {page_num+1}: line count ({len(text_blocks)}) "
+            f"!= BT..ET count ({len(text_mcids)}) — some tagged regions won't "
+            f"get a matching struct element"
+        )
+
+    text_xrefs = [
+        create_text_struct_element(doc, page_xref, mcid, doc_struct_xref)
+        for mcid in text_mcids
+    ]
+
+    print(f"🦜 [Polly Core] page {page_num+1}: img_y0={img_y0:.1f}")
+
+    # Combine image + text into one reading-order sequence, sorted by y0
+    items = [{"y0": img_y0, "mcid": img_mcid, "xref": fig_xref}]
+    for blk, mcid, xref in zip(text_blocks, text_mcids, text_xrefs):
+        items.append({"y0": blk["bbox"][1], "mcid": mcid, "xref": xref})
+    items.sort(key=lambda it: it["y0"])
+
+    print(f"🦜 [Polly Core] page {page_num+1}: wiring {len(items)} struct element(s) in reading order:")
+    for it in items:
+        print(f"🦜 [Polly Core]   y0={it['y0']:.1f} mcid={it['mcid']} xref={it['xref']}")
+
+    # Wire each struct element into the tree in that sorted order
+    for it in items:
+        append_to_document_struct_k(doc, it["xref"])
+        update_parent_tree(doc, it["mcid"], it["xref"], page_num)
+
+    increment_parent_tree_next_key(doc, max(it["mcid"] for it in items))
 
     return (
         f"Untagged+scaffold: page {page_num+1}, imgIdx {img_index}, "
-        f"MCID {mcid}, struct xref {fig_xref}"
+        f"MCID {img_mcid}, struct xref {fig_xref}, "
+        f"+{len(text_mcids)} text block(s) tagged"
     )
 
 
@@ -898,10 +1054,11 @@ def find_alt_in_struct_tree(doc: fitz.Document, page_num: int, img_index: int) -
     return ""
     
 @app.route("/inspect", methods=["POST"])
+@app.route("/inspect", methods=["POST"])
 def inspect_pdf():
     """
     Helper endpoint: given a PDF, return the list of raster images per page
-    so the WordPress frontend can map PDF.js canvas tokens to (pageIdx, imgIdx) pairs.
+    enriched with matrix translation transformation orientations.
     """
     try:
         if "pdf" not in request.files:
@@ -910,7 +1067,7 @@ def inspect_pdf():
         file_bytes = request.files["pdf"].read()
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         tagged = is_tagged(doc)
-
+ 
         pages = {}
         for page_num in range(doc.page_count):
             images = doc[page_num].get_images(full=True)
@@ -927,13 +1084,12 @@ def inspect_pdf():
                     }
                     for i, img in enumerate(raster)
                 ]
-
         doc.close()
         return jsonify({"tagged": tagged, "pages": pages})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
+ 
 
 if __name__ == "__main__":
     print("🦜 Polly PDF Microserver active on port 5001...")

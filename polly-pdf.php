@@ -72,7 +72,6 @@ function polly_pdf_get_available_models() {
 // =============================================================================
 
 add_action( 'admin_menu', function () {
-    // 1. Dedicated PDF Workspace screen
     add_menu_page(
         'Polly PDF Remediation',
         'Polly PDF',
@@ -83,7 +82,6 @@ add_action( 'admin_menu', function () {
         30
     );
 
-    // 2. Settings sub-menu page
     add_submenu_page(
         'polly-pdf-workspace',
         'Polly PDF Settings',
@@ -94,7 +92,6 @@ add_action( 'admin_menu', function () {
     );
 } );
 
-// Action links shortcut on the primary Plugins page row
 add_filter( 'plugin_action_links_' . plugin_basename( POLLY_PDF_PLUGIN_FILE ), function ( $links ) {
     $settings_link = '<a href="' . esc_url( admin_url( 'admin.php?page=polly-pdf-settings' ) ) . '">'
         . __( 'Settings' ) . '</a>';
@@ -140,8 +137,6 @@ add_action( 'admin_init', function () {
             ];
         }
 
-        // --- Dynamic Default Engine (Mirroring Polly Alt) ---
-        // 1. Look for the absolute newest active flash model to mark as recommended
         $recommended_model = '';
         foreach ( array_keys( $models ) as $model_key ) {
             if ( strpos( $model_key, '-flash' ) !== false ) {
@@ -151,18 +146,15 @@ add_action( 'admin_init', function () {
             }
         }
         
-        // 2. Fall back to the first available model if no explicitly named flash model exists
         if ( empty( $recommended_model ) ) {
             $model_keys = array_keys( $models );
             $recommended_model = ! empty( $model_keys ) ? $model_keys[0] : '';
         }
 
-        // 3. Check the database, defaulting to our dynamically calculated recommendation
         $current_model = get_option( 'polly_pdf_model', $recommended_model );
         ?>
         <select name="polly_pdf_model" id="polly-pdf-model" style="min-width: 250px;">
             <?php foreach ( $models as $value => $label ) : 
-                // Dynamically append the label to the live recommended model
                 $display_label = ( $recommended_model === $value ) ? $label . ' (Recommended)' : $label;
                 ?>
                 <option value="<?php echo esc_attr( $value ); ?>" <?php selected( $current_model, $value ); ?>>
@@ -292,12 +284,13 @@ function polly_pdf_workspace_page() {
                 </div>
 
                 <div id="status-bar" style="position: absolute; bottom: 0; left: 0; right: 0; padding: 10px 20px; background: white; border-top: 1px solid #ccd0d4; font-size: 0.85rem; display: flex; justify-content: space-between;">
-                    <span id="status-left">Polly PDF v0.3.0</span>
+                    <span id="status-left">Polly PDF v0.4.0</span>
                     <span id="status-right" style="font-weight: 600;">Idle</span>
                 </div>
             </div>
         </div>
     </div>
+<<<<<<< HEAD
 
     <!-- Consolidated styling variables to guarantee perfect visual presentation -->
     <style>
@@ -942,10 +935,11 @@ function polly_pdf_workspace_page() {
             initPolly();
         })();
     </script>
+=======
+>>>>>>> 689cddb (including all lines of text, but not as paragraphs)
     <?php
 }
 
-// Enqueue dependencies for our PDF dashboard screen
 add_action( 'admin_enqueue_scripts', function ( $hook ) {
     if ( 'toplevel_page_polly-pdf-workspace' !== $hook ) return;
 
@@ -971,4 +965,20 @@ add_action( 'admin_enqueue_scripts', function ( $hook ) {
         null,
         false
     );
+
+    wp_enqueue_script(
+        'polly-pdf-logic',
+        plugin_dir_url( POLLY_PDF_PLUGIN_FILE ) . 'polly-pdf.js',
+        [],
+        POLLY_PDF_VERSION,
+        true
+    );
+
+    wp_localize_script( 'polly-pdf-logic', 'pollyPdfConfig', [
+        'model'       => get_option( 'polly_pdf_model', 'gemini-2.0-flash' ),
+        'serverUrl'   => get_option( 'polly_pdf_server_url', 'http://localhost:5001' ),
+        'choiceCount' => intval( get_option( 'polly_pdf_choice_count', 3 ) ),
+        'ajaxUrl'     => admin_url( 'admin-ajax.php' ),
+        'nonce'       => wp_create_nonce( 'polly_pdf_nonce' )
+    ] );
 } );
