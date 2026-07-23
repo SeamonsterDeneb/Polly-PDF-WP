@@ -130,15 +130,19 @@ def get_next_page_mcid(doc: fitz.Document, page_num: int) -> int:
 def _get_document_struct_xref(doc: fitz.Document) -> int:
     """
     Find the element whose /K array we should append new struct elements to.
-    - If StructTreeRoot's /K is a single ref to a /Document element, return that.
-    - If StructTreeRoot's /K is already a flat array (no /Document wrapper),
-      return the StructTreeRoot xref itself so we append directly to it.
+    - If StructTreeRoot's /K is a single ref to a /Document element (bare
+      "/K 47 0 R" OR bracketed "/K [ 47 0 R ]" — our scaffold uses the
+      bracketed form), return that element's xref.
+    - If StructTreeRoot's /K is already a flat multi-entry array (no
+      /Document wrapper), return the StructTreeRoot xref itself so we
+      append directly to it.
     """
     struct_root_xref = _get_struct_root_xref(doc)
     struct_root = doc.xref_object(struct_root_xref)
 
-    # Case 1: single /K ref -> check if it's a /Document element
-    single = re.search(r'/K\s+(\d+)\s+0\s+R', struct_root)
+    # Case 1: single /K ref, with or without surrounding brackets ->
+    # check if it points at a /Document element
+    single = re.search(r'/K\s*\[?\s*(\d+)\s+0\s+R\s*\]?', struct_root)
     if single:
         candidate_xref = int(single.group(1))
         candidate = doc.xref_object(candidate_xref)
@@ -436,8 +440,13 @@ def create_text_struct_element(
     return p_xref
 
 
-def append_to_document_struct_k(doc: fitz.Document, new_xref: int) -> None:
-    """Add the new struct element xref to the appropriate /K array."""
+def append_to_document_struct_k(doc: fitz.Document, new_xref: int, page_xref: int = None) -> None:
+    """
+    Add the new struct element xref to the appropriate /K array.
+    If page_xref is given, tries to insert after the last existing element
+    for that same page (keeps same-page elements grouped); otherwise (or if
+    no match is found) appends at the end.
+    """
     target_xref = _get_document_struct_xref(doc)
     target_obj = doc.xref_object(target_xref)
 
@@ -449,22 +458,24 @@ def append_to_document_struct_k(doc: fitz.Document, new_xref: int) -> None:
     entries = re.findall(r'(\d+)\s+0\s+R', k_match.group(1))
     new_ref = f"{new_xref} 0 R"
 
-    # Find the last entry whose /Pg matches our page_xref
+    # Find the last entry whose /Pg matches our page_xref, if one was given
     insert_after = -1
-    for i, entry_xref_str in enumerate(entries):
-        try:
-            obj = doc.xref_object(int(entry_xref_str))
-            pg = re.search(r'/Pg\s+(\d+)\s+0\s+R', obj)
-            if pg and int(pg.group(1)) == page_xref:
-                insert_after = i
-        except:
-            pass
+    if page_xref is not None:
+        for i, entry_xref_str in enumerate(entries):
+            try:
+                obj = doc.xref_object(int(entry_xref_str))
+                pg = re.search(r'/Pg\s+(\d+)\s+0\s+R', obj)
+                if pg and int(pg.group(1)) == page_xref:
+                    insert_after = i
+            except Exception:
+                pass
 
     if insert_after >= 0:
         # Insert after the last same-page element
         entries.insert(insert_after + 1, new_ref)
     else:
-        # No existing elements on this page found — append at end
+        # No page_xref given, or no existing elements on this page found —
+        # append at end
         entries.append(new_ref)
 
     # Rebuild the K array
@@ -482,29 +493,38 @@ def append_to_document_struct_k(doc: fitz.Document, new_xref: int) -> None:
     doc.update_object(target_xref, updated)
 
 
-def update_parent_tree(doc: fitz.Document, mcid: int, struct_xref: int) -> None:
+def update_parent_tree(doc: fitz.Document, mcid: int, struct_xref: int, page_num: int = 0) -> None:
     """
     Add a new MCID->struct_xref mapping to the ParentTree.
 
     The ParentTree /Nums array maps PAGE SLOT indices (the /StructParents
-    value on each page dict) to arrays of struct element refs — one ref
-    per MCID on that page, in MCID order.
-
-    For Acrobat/LibreOffice docs the new Figure's MCID may not be
-    contiguous with the existing ones, so we append to the existing
-    page-slot array rather than adding a new top-level entry.
+    value on each page dict) to arrays of struct element refs. This is NOT
+    the same as MCID numbers — using page_num's actual /StructParents value
+    to find the correct slot is what avoids corrupting multi-page documents
+    (an earlier version hardcoded slot 0, which broke pages 2+).
     """
     pt_xref = _get_parent_tree_xref(doc)
     pt_obj = doc.xref_object(pt_xref)
 
-    # Find the page-slot array that already exists for slot 0
-    # (for single-page docs this is always slot 0; multi-page handled below)
-    # Pattern: 0 [ ref ref ref ... ]
-    slot_array_m = re.search(r'(0\s+\[)([^\]]*?)(\])', pt_obj)
+    # Get the page's StructParents slot number
+    page_obj = doc.xref_object(doc[page_num].xref)
+    sp_m = re.search(r'/StructParents\s+(\d+)', page_obj)
+    page_slot = int(sp_m.group(1)) if sp_m else 0
+
+    print(f"🦜 [Polly Core] update_parent_tree: page={page_num} slot={page_slot} mcid={mcid} struct_xref={struct_xref}")
+
+    # Look for existing array for this page's slot
+    slot_array_m = re.search(
+        rf'({page_slot}\s+\[)([^\]]*?)(\])',
+        pt_obj
+    )
     if slot_array_m:
-        # Append new struct ref to the existing array for this page slot
         existing_entries = slot_array_m.group(2)
-        new_entries = existing_entries.rstrip() + f"\n        {struct_xref} 0 R "
+        # Handle empty array — can't just append with leading newline
+        if existing_entries.strip():
+            new_entries = existing_entries.rstrip() + f"\n        {struct_xref} 0 R "
+        else:
+            new_entries = f" {struct_xref} 0 R "
         updated = (
             pt_obj[:slot_array_m.start(2)]
             + new_entries
@@ -513,8 +533,7 @@ def update_parent_tree(doc: fitz.Document, mcid: int, struct_xref: int) -> None:
         doc.update_object(pt_xref, updated)
         return
 
-    # No existing array for slot 0 — fall back to appending a new Nums entry
-    # (this is the InDesign path where each MCID gets its own top-level slot)
+    # No existing array for this slot — append new Nums entry
     new_entry = f"\n  {mcid} {struct_xref} 0 R"
     if pt_obj.rstrip().endswith("]"):
         updated = pt_obj.rstrip()[:-1] + new_entry + "\n]"
@@ -634,7 +653,7 @@ def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_tex
         arr_xref = _get_page_struct_parents_array_xref(doc, page_num)
         mcid = _get_next_free_mcid_in_page_array(doc, arr_xref)
 
-        rewrite_content_stream_for_image(doc, page_num, img_index, mcid)
+        rewrite_content_stream_by_name_or_index(doc, page_num, img_index, img_name, mcid)
         fig_xref = create_figure_struct_element(doc, page_xref, mcid, alt_text, page_num, img_index)
         append_to_document_struct_k(doc, fig_xref, page_xref)
         _insert_struct_elem_into_page_array(doc, arr_xref, mcid, fig_xref)
@@ -654,10 +673,10 @@ def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_tex
     update_parent_tree(doc, mcid, fig_xref)
     increment_parent_tree_next_key(doc, mcid)
 
-        return (
-            f"Tagged (global): page {page_num+1}, imgIdx {img_index} "
-            f"-> MCID {mcid}, struct xref {fig_xref}"
-        )
+    return (
+        f"Tagged (global): page {page_num+1}, imgIdx {img_index} "
+        f"-> MCID {mcid}, struct xref {fig_xref}"
+    )
 
 def _get_image_resource_name(doc: fitz.Document, page_num: int, img_xref: int) -> str:
     """
@@ -738,10 +757,16 @@ def _ensure_struct_tree(doc: fitz.Document) -> None:
 
     print("🦜 [Polly Core] Building struct tree scaffold for untagged PDF")
 
-    # 1. ParentTree
+    # 1. ParentTree — pre-populate one empty slot per page. This is required:
+    # update_parent_tree() below finds the right slot by regex-matching
+    # "<slot> [...]", which only works if every page's slot already exists
+    # as its own empty array rather than one shared empty /Nums [].
     pt_xref = doc.get_new_xref()
     print(f"🦜 [Polly Core] scaffold step 1: ParentTree xref={pt_xref}")
-    doc.update_object(pt_xref, "<< /Nums [] >>")
+    nums_entries = ""
+    for i in range(doc.page_count):
+        nums_entries += f"\n    {i} []"
+    doc.update_object(pt_xref, f"<< /Nums [{nums_entries}\n  ] >>")
 
     # 2. Document struct element
     doc_xref = doc.get_new_xref()
@@ -953,6 +978,30 @@ def remediate_pdf():
         if not results and errors:
             return jsonify({"error": "All remediations failed", "details": errors}), 422
 
+        # TEMP DIAGNOSTIC — dump the actual struct tree objects so we can see
+        # what really landed before save() potentially rewrites/garbage-collects
+        # anything. Remove once we've confirmed the tree is well-formed.
+        try:
+            print("🦜 [Polly Core] ===== STRUCT TREE DUMP =====")
+            struct_root_xref = _get_struct_root_xref(doc)
+            print(f"🦜 [Polly Core] StructTreeRoot (xref={struct_root_xref}):")
+            print(doc.xref_object(struct_root_xref))
+
+            doc_struct_xref = _get_document_struct_xref(doc)
+            print(f"🦜 [Polly Core] Document elem (xref={doc_struct_xref}):")
+            print(doc.xref_object(doc_struct_xref))
+
+            pt_xref = _get_parent_tree_xref(doc)
+            print(f"🦜 [Polly Core] ParentTree (xref={pt_xref}):")
+            print(doc.xref_object(pt_xref))
+
+            cat_xref = doc.pdf_catalog()
+            print(f"🦜 [Polly Core] Catalog (xref={cat_xref}):")
+            print(doc.xref_object(cat_xref))
+            print("🦜 [Polly Core] ===== END STRUCT TREE DUMP =====")
+        except Exception as e:
+            print(f"🦜 [Polly Core] ⚠️ struct tree dump failed: {e}")
+
         # --- Compile output ---
         print(f"🦜 [Polly Core] Attempting save...")
         output_buffer = io.BytesIO()
@@ -1053,7 +1102,6 @@ def find_alt_in_struct_tree(doc: fitz.Document, page_num: int, img_index: int) -
 
     return ""
     
-@app.route("/inspect", methods=["POST"])
 @app.route("/inspect", methods=["POST"])
 def inspect_pdf():
     """

@@ -570,7 +570,11 @@
                 await runRemediation(task);
             } catch (err) {
                 console.error(err);
-                task.modalCtl.showError(`Analysis failed: ${err.message}`, () => {
+                const errorMsg = (err instanceof SyntaxError || (err.message && err.message.includes("JSON")))
+                    ? "🦜 Squawk! Looks like Gemini was a little tipsy just then and scrambled the text. Click 'Try Again' in a moment!"
+                    : `Analysis failed: ${err.message}`;
+
+                task.modalCtl.showError(errorMsg, () => {
                     window.addToQueue(task.index, task.base64, task.pageIdx, task.imgName);
                 });
                 
@@ -616,8 +620,12 @@
             }
 
             const responsePayload = resultData.data;
-            const rawText = responsePayload.candidates[0].content.parts[0].text
-                .replace(/```json/g, '').replace(/```/g, '').trim();
+            let rawText = responsePayload.candidates[0].content.parts[0].text
+                .replace(/```json/gi, '').replace(/```/g, '').trim();
+            
+            // Strip trailing commas before closing brackets or braces (common LLM syntax error)
+            rawText = rawText.replace(/,\s*([\]}])/g, '$1');
+
             const choices = JSON.parse(rawText);
 
             // Re-render baseline text inputs back to sidebar container frame
