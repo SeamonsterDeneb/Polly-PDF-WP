@@ -235,7 +235,13 @@
                 card.innerHTML = `
                     <img src="${dataUrl}">
                     <div class="image-info" style="margin-top: 10px; font-size: 0.8rem;">
-                        <span class="badge ${alreadyTagged ? 'badge-remediated' : 'badge-untagged'}" id="badge-${index}" style="display: inline-block; padding: 2px 6px; border-radius: 4px; font-weight: bold; text-transform: uppercase; font-size: 0.65rem; margin-bottom: 8px;">${alreadyTagged ? 'Already Tagged' : 'Untagged'}</span>
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                            <span class="badge ${alreadyTagged ? 'badge-remediated' : 'badge-untagged'}" id="badge-${index}" style="display: inline-block; padding: 2px 6px; border-radius: 4px; font-weight: bold; text-transform: uppercase; font-size: 0.65rem;">${alreadyTagged ? 'Already Tagged' : 'Untagged'}</span>
+                            <label style="display: flex; align-items: center; gap: 5px; font-size: 0.72rem; color: #444; cursor: pointer; font-weight: 600; white-space: nowrap;">
+                                <input type="checkbox" id="card-deco-${index}" style="margin: 0;">
+                                Decorative Artifact
+                            </label>
+                        </div>
                         <div><strong>Asset #${index}</strong> (Page ${pageNum})</div>
                         <div id="content-${index}">
                             <textarea
@@ -257,12 +263,35 @@
                     pageIdx: pageIdx,
                     imgIdx: pageImgIndex,
                     imgName: imgName,
-                    alt: existingAlt
+                    alt: existingAlt,
+                    decorative: false
                 };
 
                 const textarea = document.getElementById(`alt-text-${index}`);
+                const decoCheckbox = document.getElementById(`card-deco-${index}`);
+                const badge = document.getElementById(`badge-${index}`);
+
                 if (textarea) {
                     textarea.addEventListener('input', updateDownloadButton);
+                }
+
+                if (decoCheckbox) {
+                    decoCheckbox.addEventListener('change', () => {
+                        const isDeco = decoCheckbox.checked;
+                        remediationResults[index].decorative = isDeco;
+                        if (isDeco) {
+                            if (textarea) textarea.disabled = true;
+                            badge.className = 'badge badge-artifact';
+                            badge.innerText = 'Decorative Artifact';
+                        } else {
+                            if (textarea) textarea.disabled = false;
+                            const currentVal = textarea ? textarea.value.trim() : '';
+                            const isTaggedNow = currentVal.length > 0 || alreadyTagged;
+                            badge.className = `badge ${isTaggedNow ? 'badge-remediated' : 'badge-untagged'}`;
+                            badge.innerText = isTaggedNow ? (alreadyTagged ? 'Already Tagged' : 'Remediated') : 'Untagged';
+                        }
+                        updateDownloadButton();
+                    });
                 }
             } catch(e) { console.error('renderImageToGallery error:', e); }
         }
@@ -648,9 +677,16 @@
             // Populate choices inside active working display frame template
             task.modalCtl.populate(choices, task.currentAlt, (selectedText, isDecorative = false) => {
                 const ta = document.getElementById(`alt-text-${task.index}`);
+                const cardCheck = document.getElementById(`card-deco-${task.index}`);
+
                 if (ta) {
                     ta.value = selectedText;
+                    ta.disabled = isDecorative;
                     ta.dispatchEvent(new Event('input'));
+                }
+
+                if (cardCheck) {
+                    cardCheck.checked = isDecorative;
                 }
                 
                 task.badge.className = `badge ${isDecorative ? 'badge-artifact' : 'badge-remediated'}`;

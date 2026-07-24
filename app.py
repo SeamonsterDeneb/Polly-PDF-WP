@@ -914,6 +914,101 @@ def inject_alt_untagged(doc: fitz.Document, page_num: int, img_index: int, alt_t
 # Flask Routes
 # ---------------------------------------------------------------------------
 
+def mark_image_as_artifact(doc: fitz.Document, page_num: int, img_index: int, img_name: str = "") -> str:
+    """
+    Converts an image into a Decorative Artifact:
+    1. Strips any existing /Alt attributes from structure tree elements or image XObjects.
+    2. Wraps the image draw command in an /Artifact BDC ... EMC block in the content stream.
+    """
+    page = doc[page_num]
+    page_xref = page.xref
+
+    # 1. Strip /Alt from any existing /Figure structure elements for this page
+    for xref in range(1, doc.xref_length()):
+        try:
+            obj = doc.xref_object(xref)
+            if obj and '/Figure' in obj and f'/Pg {page_xref} 0 R' in obj:
+                if '/Alt' in obj:
+                    cleaned_obj = re.sub(r'/Alt\s*(\([^)]*\)|<[^>]*>)', '', obj)
+                    doc.update_object(xref, cleaned_obj)
+        except Exception:
+            pass
+
+    # 2. Strip /Alt from the image XObject dictionary itself if present
+    try:
+        images = page.get_images(full=True)
+        raster = [i for i in images if i[2] > 1]
+        if img_index < len(raster):
+            img_xref = raster[img_index][0]
+            img_obj = doc.xref_object(img_xref)
+            if '/Alt' in img_obj:
+                cleaned_img_obj = re.sub(r'/Alt\s*(\([^)]*\)|<[^>]*>)', '', img_obj)
+                doc.update_object(img_xref, cleaned_img_obj)
+    except Exception:
+        pass
+
+    # 3. Rewrite content stream to wrap or convert the drawing command to /Artifact BDC
+    content = page.read_contents().decode("latin-1")
+    clean_name = img_name.strip()
+    if clean_name and not clean_name.startswith("/"):
+        clean_name = "/" + clean_name
+
+    do_pos = -1
+    if clean_name:
+        m = re.search(re.escape(clean_name) + r'\s+Do\b', content)
+        if m:
+            do_pos = m.start()
+
+    if do_pos == -1:
+        do_matches = list(re.finditer(r'/\w+\s+Do', content))
+        if img_index < len(do_matches):
+            do_pos = do_matches[img_index].start()
+
+    if do_pos == -1:
+        raise ValueError(f"Could not locate image target draw token on page {page_num+1}")
+
+    pre = content[:do_pos]
+    bdc_match = None
+    for m in re.finditer(r'/(Artifact|Figure|P|Span)\s*(<<[^>]*>>)?\s*BDC', pre):
+        bdc_match = m
+
+    if bdc_match:
+        # Replace existing figure BDC header with /Artifact BDC
+        block_start = bdc_match.start()
+        post = content[do_pos:]
+        emc_m = re.search(r'\bEMC\b', post)
+        if emc_m:
+            close_pos = do_pos + emc_m.end()
+            inner = content[block_start:close_pos]
+            new_inner = re.sub(r'/(Figure|P|Span|Artifact)\s*(<<[^>]*>>)?\s*BDC', '/Artifact BDC', inner, count=1)
+            new_content = content[:block_start] + new_inner + content[close_pos:]
+        else:
+            new_content = content[:do_pos] + "\n/Artifact BDC\n" + content[do_pos:]
+    else:
+        # Wrap the q...Q block or Do command line in /Artifact BDC ... EMC
+        q_pos = -1
+        for qm in re.finditer(r'(?:^|\n| )q(?:\n| )', pre):
+            q_pos = qm.start()
+
+        if q_pos >= 0:
+            q_char_pos = q_pos + 1 if content[q_pos] in (' ', '\n') else q_pos
+            post = content[do_pos:]
+            q_close = re.search(r'[\n ]Q[\n ]|[\n ]Q$', post) or re.search(r'Q', post)
+            if q_close:
+                close_pos = do_pos + q_close.end()
+                img_block = content[q_char_pos:close_pos]
+                new_block = f"\n/Artifact BDC\n{img_block.strip()}\nEMC\n"
+                new_content = content[:q_char_pos] + new_block + content[close_pos:]
+            else:
+                new_content = content[:do_pos] + "\n/Artifact BDC\n" + content[do_pos:]
+        else:
+            new_content = content[:do_pos] + "\n/Artifact BDC\n" + content[do_pos:]
+
+    contents_xref = _get_contents_xref(doc, page_num)
+    doc.update_stream(contents_xref, new_content.encode("latin-1"), compress=False)
+
+    return f"Decorative Artifact: page {page_num+1}, imgIdx {img_index}"
+
 @app.route("/remediate", methods=["POST"])
 def remediate_pdf():
     try:
@@ -956,10 +1051,9 @@ def remediate_pdf():
                 is_decorative = data.get("decorative", False)
 
                 if is_decorative:
-                    # Phase 1 stub: skip decorative images until full artifact
-                    # pipeline is implemented in Phase 2
-                    print(f"🦜 [Polly Core] ⬜ Asset {asset_id}: marked decorative — skipping (Phase 2 pending)")
-                    results.append(f"Decorative (stub): page {page_num+1}, imgIdx {img_index}")
+                    status = mark_image_as_artifact(doc, page_num, img_index, img_name)
+                    results.append(status)
+                    print(f"🦜 [Polly Core] 🎨 {status}")
                     continue
 
                 if tagged:
