@@ -213,32 +213,25 @@ def rewrite_content_stream_by_name_or_index(
     doc: fitz.Document, page_num: int, img_index: int, img_name: str, mcid: int
 ) -> bool:
     """
-    Finds the drawing sequence of an image using either its explicit internal resource 
-    dictionary key (e.g. /X0, /Im1, /X9) or a sequential fallback index, 
-    then wraps it safely within a /Figure structural element tag.
+    Surgically locates and wraps ONLY the target image drawing sequence in a /Figure <</MCID n>> BDC ... EMC pair.
+    Never consumes preceding or trailing text content streams.
     """
     print(f"🦜 [Polly Core] rewrite_content_stream: page={page_num} imgIdx={img_index} mcid={mcid}")
     page = doc[page_num]
     content = page.read_contents().decode("latin-1")
-    print(f"🦜 [Polly Core] content stream length: {len(content)}")
-    print(f"🦜 [Polly Core] Do commands found: {re.findall(r'/\\w+\\s+Do', content)}")
 
-    # Clean the name entry to handle formatting variations
     clean_name = img_name.strip()
     if clean_name and not clean_name.startswith("/"):
         clean_name = "/" + clean_name
 
-    # Try matching explicitly by the layout resource name
     do_pos = -1
     if clean_name:
         name_match = re.search(re.escape(clean_name) + r'\s+Do\b', content)
         if name_match:
             do_pos = name_match.start()
 
-    # Fall back to index-based match
     if do_pos == -1:
         do_matches = list(re.finditer(r'/\w+\s+Do', content))
-        print(f"🦜 [Polly Core] All Do commands: {[m.group(0) for m in do_matches]}")
         if img_index < len(do_matches):
             do_pos = do_matches[img_index].start()
         else:
@@ -246,84 +239,43 @@ def rewrite_content_stream_by_name_or_index(
             if img_index < len(do_matches_fallback):
                 do_pos = do_matches_fallback[img_index].start()
 
-    print(f"🦜 [Polly Core] do_pos={do_pos}")
-
     if do_pos == -1:
         raise ValueError(f"Could not locate image target draw token on page {page_num+1}")
 
     pre = content[:do_pos]
-    
-    # Locate the outermost wrapping block boundaries
-    bdc_match = None
-    for m in re.finditer(r'/(Artifact|Figure|P|Span)\s*<<[^>]*>>\s*BDC', pre):
-        bdc_match = m
-    
-    if bdc_match is None:
-        # Search for q with any surrounding whitespace (inline or newline-separated)
-        q_match = re.search(r'[\n ]q[\n ]', pre)
-        # Walk backwards to find the LAST q before the Do command
-        q_pos = -1
-        for qm in re.finditer(r'(?:^|\n| )q(?:\n| )', pre):
-            q_pos = qm.start()
+    post = content[do_pos:]
 
-        if q_pos < 0:
-            # No q found at all — minimal wrap of just the Do command line
-            post_line = content[do_pos:]
-            end_line_match = re.search(r'[\n]|Q', post_line)
-            end_line_pos = do_pos + (end_line_match.end() if end_line_match else len(post_line))
-            target_draw_cmd = content[do_pos:end_line_pos].strip()
-            new_content = (
-                content[:do_pos]
-                + f"\n/Figure << /MCID {mcid} >>BDC\n{target_draw_cmd}\nEMC\n"
-                + content[end_line_pos:]
-            )
+    # Find the immediate q before do_pos
+    q_pos = -1
+    for qm in re.finditer(r'(?:^|[\n ])q(?:[\n ]|$)', pre):
+        q_pos = qm.start()
+
+    # Find the matching Q after do_pos
+    q_close = re.search(r'(?:^|[\n ])Q(?:[\n ]|$)', post)
+
+    if q_pos >= 0 and q_close:
+        close_pos = do_pos + q_close.end()
+        block_content = content[q_pos:close_pos]
+        # Verify block strictly contains ONLY this single image draw sequence
+        if block_content.count(" Do") == 1 and "BT" not in block_content:
+            q_char_pos = q_pos + 1 if content[q_pos] in (' ', '\n') else q_pos
+            img_block = content[q_char_pos:close_pos]
+            new_block = f"\n/Figure << /MCID {mcid} >>BDC\n{img_block.strip()}\nEMC\n"
+            new_content = content[:q_char_pos] + new_block + content[close_pos:]
             contents_xref = _get_contents_xref(doc, page_num)
-            print(f"🦜 [Polly Core] contents_xref={contents_xref}, new content length={len(new_content)}")
-            print(f"🦜 [Polly Core] content around injection: {repr(new_content[max(0,new_content.find('Figure')-20):new_content.find('Figure')+80])}")
             doc.update_stream(contents_xref, new_content.encode("latin-1"), compress=False)
             return True
 
-        # Find the matching Q after the Do command
-        # Use the full inline pattern — Q may be space-separated, not newline
-        post = content[do_pos:]
-        q_close = re.search(r'[\n ]Q[\n ]|[\n ]Q$', post)
-        if not q_close:
-            # Last resort — find any Q
-            q_close = re.search(r'Q', post)
-        if not q_close:
-            raise ValueError(f"Could not find closing 'Q' frame after image on page {page_num+1}")
-
-        close_pos = do_pos + q_close.end()
-
-        # Grab the full q...Q block including the opening q whitespace char
-        # q_pos points at the whitespace before q — include from q itself
-        q_char_pos = q_pos + 1 if content[q_pos] in (' ', '\n') else q_pos
-        img_block = content[q_char_pos:close_pos]
-        new_block = f"\n/Figure << /MCID {mcid} >>BDC\n{img_block.strip()}\nEMC\n"
-        new_content = content[:q_char_pos] + new_block + content[close_pos:]
-    else:
-        block_start = bdc_match.start()
-        between = content[block_start:do_pos]
-        open_count = len(re.findall(r'\bBDC\b', between))
-        
-        post = content[do_pos:]
-        emc_positions = [m.end() for m in re.finditer(r'\bEMC\b', post)]
-        
-        if open_count > len(emc_positions):
-            open_count = len(emc_positions)
-        
-        close_pos = do_pos + emc_positions[open_count - 1] if emc_positions else do_pos
-        inner = content[block_start:close_pos]
-        
-        inner_q = re.search(r'q\s+.*Do.*\s+Q|q\n.*\nQ', inner, re.DOTALL)
-        drawing = inner_q.group(0) if inner_q else inner
-        
-        new_block = f"\n/Figure << /MCID {mcid} >>BDC\n{drawing.strip()}\nEMC\n"
-        new_content = content[:block_start] + new_block + content[close_pos:]
-
+    # Fallback: wrap just the Do line itself
+    end_line_match = re.search(r'[\n]|Q', post)
+    end_line_pos = do_pos + (end_line_match.end() if end_line_match else len(post))
+    target_draw_cmd = content[do_pos:end_line_pos].strip()
+    new_content = (
+        content[:do_pos]
+        + f"\n/Figure << /MCID {mcid} >>BDC\n{target_draw_cmd}\nEMC\n"
+        + content[end_line_pos:]
+    )
     contents_xref = _get_contents_xref(doc, page_num)
-    print(f"🦜 [Polly Core] contents_xref={contents_xref}, new content length={len(new_content)}")
-    print(f"🦜 [Polly Core] content around injection: {repr(new_content[max(0,new_content.find('Figure')-20):new_content.find('Figure')+80])}")
     doc.update_stream(contents_xref, new_content.encode("latin-1"), compress=False)
     return True
 
@@ -455,15 +407,21 @@ def append_to_document_struct_k(doc: fitz.Document, new_xref: int, page_xref: in
     if not k_match:
         raise ValueError("Could not find /K array in struct element")
 
-    entries = re.findall(r'(\d+)\s+0\s+R', k_match.group(1))
+    # IMPORTANT: capture the FULL reference ("73 0 R"), not just the digits.
+    # A previous version captured only the number, which silently turned
+    # every existing entry into a bare, meaningless integer the first time
+    # this function ran — corrupting the entire Document element's /K
+    # array and orphaning every pre-existing tagged element in the doc.
+    entries = re.findall(r'\d+\s+0\s+R', k_match.group(1))
     new_ref = f"{new_xref} 0 R"
 
     # Find the last entry whose /Pg matches our page_xref, if one was given
     insert_after = -1
     if page_xref is not None:
-        for i, entry_xref_str in enumerate(entries):
+        for i, entry_ref in enumerate(entries):
             try:
-                obj = doc.xref_object(int(entry_xref_str))
+                entry_xref = int(entry_ref.split()[0])
+                obj = doc.xref_object(entry_xref)
                 pg = re.search(r'/Pg\s+(\d+)\s+0\s+R', obj)
                 if pg and int(pg.group(1)) == page_xref:
                     insert_after = i
@@ -569,8 +527,11 @@ def _uses_page_local_mcids(doc: fitz.Document, page_num: int) -> bool:
     """
     Detect whether this PDF uses page-local MCID arrays (Acrobat style)
     vs global MCID keys (InDesign style).
-    Page-local: ParentTree[StructParents] -> an array object
-    Global: ParentTree[StructParents] -> a single struct element ref
+    Page-local: ParentTree[StructParents] -> an array (either an INLINE
+    array literal, e.g. "0 [ null null 98 0 R ]", or an indirect reference
+    to a separate array object — real-world Acrobat/LibreOffice PDFs use
+    the inline form).
+    Global: ParentTree[StructParents] -> a single struct element ref.
     """
     try:
         page = doc[page_num]
@@ -583,100 +544,563 @@ def _uses_page_local_mcids(doc: fitz.Document, page_num: int) -> bool:
         pt_xref = _get_parent_tree_xref(doc)
         pt = doc.xref_object(pt_xref)
 
+        # Inline array form: "<sp_val> [ ... ]" directly in the ParentTree
+        if re.search(rf'\b{sp_val}\s+\[', pt):
+            return True
+
+        # Indirect-reference form: "<sp_val> <xref> 0 R" pointing at a
+        # separate object — check whether that object is an array or a dict
         entry_match = re.search(rf'\b{sp_val}\s+(\d+)\s+0\s+R', pt)
         if not entry_match:
             return False
 
         candidate_xref = int(entry_match.group(1))
         candidate = doc.xref_object(candidate_xref)
-        # If it starts with '[' it's an array (page-local), else it's a dict (global)
         return candidate.strip().startswith('[')
     except Exception:
         return False
 
 
-def _get_page_struct_parents_array_xref(doc: fitz.Document, page_num: int) -> int:
-    """Get the xref of the StructParents array for this page."""
+def _get_page_local_slot_entries(doc: fitz.Document, page_num: int) -> tuple[list, bool, int]:
+    """
+    Returns (entries, is_inline, source_xref) for this page's page-local
+    MCID slot array, where entries is a list of tokens ('null' or 'N 0 R')
+    in index order (index == MCID).
+
+    is_inline=True  -> the array lives directly inside the ParentTree object
+                        itself (source_xref is the ParentTree's own xref)
+    is_inline=False -> the array is a separate indirect object
+                        (source_xref is that array object's xref)
+    """
     page = doc[page_num]
     page_obj = doc.xref_object(page.xref)
     sp_val = int(re.search(r'/StructParents\s+(\d+)', page_obj).group(1))
+
     pt_xref = _get_parent_tree_xref(doc)
     pt = doc.xref_object(pt_xref)
-    entry_match = re.search(rf'\b{sp_val}\s+(\d+)\s+0\s+R', pt)
-    return int(entry_match.group(1))
+
+    inline_m = re.search(rf'\b{sp_val}\s+\[([^\]]*)\]', pt)
+    if inline_m:
+        entries = re.findall(r'(\d+\s+0\s+R|null)', inline_m.group(1))
+        return entries, True, pt_xref
+
+    ref_m = re.search(rf'\b{sp_val}\s+(\d+)\s+0\s+R', pt)
+    if ref_m:
+        arr_xref = int(ref_m.group(1))
+        arr_obj = doc.xref_object(arr_xref)
+        entries = re.findall(r'(\d+\s+0\s+R|null)', arr_obj)
+        return entries, False, arr_xref
+
+    raise ValueError(f"No page-local ParentTree slot found for StructParents {sp_val}")
 
 
-def _get_next_free_mcid_in_page_array(doc: fitz.Document, arr_xref: int) -> int:
+def _get_next_free_mcid_in_page_array(doc: fitz.Document, page_num: int) -> int:
     """
     Find the first null slot index in a page's StructParents array.
     That index becomes the MCID for our new Figure.
     """
-    arr = doc.xref_object(arr_xref)
-    slots = re.findall(r'(\d+ 0 R|null)', arr)
-    for i, slot in enumerate(slots):
+    entries, _, _ = _get_page_local_slot_entries(doc, page_num)
+    for i, slot in enumerate(entries):
         if slot == 'null':
             return i
-    # No nulls — return next index (we'll append)
-    return len(slots)
+    return len(entries)  # no nulls — append as a new index
 
 
 def _insert_struct_elem_into_page_array(
-    doc: fitz.Document, arr_xref: int, slot_index: int, fig_xref: int
+    doc: fitz.Document, page_num: int, slot_index: int, fig_xref: int
 ) -> None:
-    """Replace the null at slot_index in the array with our new struct element xref."""
-    arr = doc.xref_object(arr_xref)
-    slots = re.findall(r'(\d+ 0 R|null)', arr)
+    """
+    Replace the null at slot_index in this page's StructParents array with
+    our new struct element xref — handling both the inline-array case
+    (splice the rebuilt array back into the ParentTree object itself) and
+    the indirect-array case (update that separate array object directly).
+    """
+    entries, is_inline, source_xref = _get_page_local_slot_entries(doc, page_num)
 
-    if slot_index < len(slots) and slots[slot_index] == 'null':
-        slots[slot_index] = f'{fig_xref} 0 R'
+    if slot_index < len(entries) and entries[slot_index] == 'null':
+        entries[slot_index] = f'{fig_xref} 0 R'
     else:
-        slots.append(f'{fig_xref} 0 R')
+        entries.append(f'{fig_xref} 0 R')
 
-    new_arr = '[ ' + ' '.join(slots) + ' ]'
-    doc.update_object(arr_xref, new_arr)
+    new_entries_str = ' '.join(entries)
 
+    if is_inline:
+        pt_obj = doc.xref_object(source_xref)
+        page = doc[page_num]
+        page_obj = doc.xref_object(page.xref)
+        sp_val = int(re.search(r'/StructParents\s+(\d+)', page_obj).group(1))
+        updated = re.sub(
+            rf'(\b{sp_val}\s+\[)[^\]]*(\])',
+            lambda m: m.group(1) + new_entries_str + ' ' + m.group(2),
+            pt_obj,
+            count=1,
+        )
+        if updated == pt_obj:
+            raise ValueError(f"Could not update inline slot array for StructParents {sp_val}")
+        doc.update_object(source_xref, updated)
+    else:
+        new_arr = '[ ' + new_entries_str + ' ]'
+        doc.update_object(source_xref, new_arr)
+
+
+def _find_existing_figure_for_image(doc: fitz.Document, page_num: int, img_index: int) -> int:
+    """
+    Look for a Figure struct element that ALREADY covers this image, so we
+    can just update its /Alt instead of creating a redundant, nested
+    duplicate. Real-world tagged PDFs often use a generic BDC operator name
+    (e.g. "/P << /MCID 16 >> BDC") for what the struct tree still reports
+    as /S /Figure — the operator name in the content stream is NOT reliable
+    evidence of the structural role, so we match purely by MCID number and
+    by the existing struct element's own /S /Figure + /Pg fields, not by
+    requiring the literal text "/Figure" to appear in the stream.
+
+    Returns the existing Figure's xref, or -1 if none is found.
+    """
+    page_xref = doc[page_num].xref
+    content = doc[page_num].read_contents().decode("latin-1", errors="ignore")
+
+    # Any BDC-tagged MCID in stream order, regardless of operator name
+    all_bdc_mcids = [int(m) for m in re.findall(r'<<\s*/MCID\s+(\d+)\s*>>\s*BDC', content)]
+    print(f"🦜 [Polly Core] _find_existing_figure_for_image: page={page_num} imgIdx={img_index} all_bdc_mcids={all_bdc_mcids}")
+
+    target_mcid = all_bdc_mcids[img_index] if img_index < len(all_bdc_mcids) else None
+
+    # Collect existing Figure struct elements on this page, in xref order
+    page_figures = []
+    for xref in range(1, doc.xref_length()):
+        try:
+            obj = doc.xref_object(xref)
+            if not obj or '/Figure' not in obj:
+                continue
+            s_m = re.search(r'/S\s+(/\w+)', obj)
+            if not s_m or s_m.group(1) != '/Figure':
+                continue
+            pg_m = re.search(r'/Pg\s+(\d+)\s+0\s+R', obj)
+            if not pg_m or int(pg_m.group(1)) != page_xref:
+                continue
+            k_m = re.search(r'/K\s+\[?\s*(\d+)\s*\]?', obj)
+            page_figures.append((xref, int(k_m.group(1)) if k_m else -1))
+        except Exception:
+            pass
+
+    if target_mcid is not None:
+        for xref, mcid in page_figures:
+            if mcid == target_mcid:
+                return xref
+
+    # Fallback: nth Figure element by xref order (Word/Quartz-style PDFs
+    # with struct trees but no BDC markers at all for this image)
+    if img_index < len(page_figures):
+        return page_figures[img_index][0]
+
+    return -1
+
+def _find_do_position(content: str, img_index: int, img_name: str) -> int:
+    """
+    Shared "find where this image is drawn" logic, factored out so both the
+    tight-wrap logic and the enclosing-region-detection logic use identical
+    matching rules and always agree on which Do call we mean.
+    """
+    clean_name = img_name.strip()
+    if clean_name and not clean_name.startswith("/"):
+        clean_name = "/" + clean_name
+
+    do_pos = -1
+    if clean_name:
+        name_match = re.search(re.escape(clean_name) + r'\s+Do\b', content)
+        if name_match:
+            do_pos = name_match.start()
+
+    if do_pos == -1:
+        do_matches = list(re.finditer(r'/\w+\s+Do', content))
+        if img_index < len(do_matches):
+            do_pos = do_matches[img_index].start()
+        else:
+            do_matches_fallback = list(re.finditer(r'/Im\d+\s+Do', content))
+            if img_index < len(do_matches_fallback):
+                do_pos = do_matches_fallback[img_index].start()
+
+    return do_pos
+
+
+def _find_enclosing_open_bdc(content: str, do_pos: int) -> dict:
+    """
+    Returns info about the innermost marked-content region (BDC OR BMC —
+    both need tracking to keep nesting depth balanced, even though only
+    BDC regions with an /MCID are candidates to return) that is still open
+    at do_pos. Returns None if do_pos isn't inside any such region, or if
+    the only open region has no /MCID (e.g. a plain /Artifact BMC).
+    """
+    open_re = re.compile(r'/(\w+)\s*(?:<<([^>]*)>>)?\s*(BDC|BMC)')
+    close_re = re.compile(r'\bEMC\b')
+
+    tokens = []
+    for m in open_re.finditer(content):
+        if m.start() > do_pos:
+            break
+        mcid_m = re.search(r'/MCID\s+(\d+)', m.group(2) or '')
+        tokens.append((m.start(), 'open', m.group(1), int(mcid_m.group(1)) if mcid_m else None, m.end()))
+    for m in close_re.finditer(content):
+        if m.start() > do_pos:
+            break
+        tokens.append((m.start(), 'close', None, None, m.end()))
+    tokens.sort(key=lambda t: t[0])
+
+    stack = []
+    for pos, kind, tag, mcid, end in tokens:
+        if kind == 'open':
+            stack.append({'tag': tag, 'mcid': mcid, 'open_start': pos, 'open_end': end})
+        elif stack:
+            stack.pop()
+
+    for entry in reversed(stack):
+        if entry['mcid'] is not None:
+            return entry
+    return None
+
+
+def _find_matching_emc(content: str, search_start: int) -> tuple:
+    """
+    Given a position right after an already-open BDC/BMC (depth 1), scans
+    forward to find (start, end) of the EMC that closes it, correctly
+    accounting for further BDC or BMC nesting in between (e.g. a nested
+    /Artifact BMC...EMC pair for a different image sitting inside the same
+    outer region).
+    """
+    depth = 1
+    for m in re.finditer(r'\bBDC\b|\bBMC\b|\bEMC\b', content[search_start:]):
+        if m.group(0) in ('BDC', 'BMC'):
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                return (search_start + m.start(), search_start + m.end())
+    return (len(content), len(content))
+
+
+def analyze_figure_insertion(doc: fitz.Document, page_num: int, img_index: int, img_name: str) -> dict:
+    """
+    Figures out WHERE and HOW to insert a new Figure BDC/EMC for this image,
+    and — critically — whether doing so tightly would end up nested inside
+    a pre-existing marked-content region that covers more than just this
+    image (e.g. a /P that also wraps a neighboring artifact image and a
+    decorative border stroke). If so, that outer region needs to be SPLIT
+    around our new Figure so the Figure becomes a sibling rather than a
+    buried child — nesting like that is what causes some readers to defer
+    announcing the Figure's alt text until the whole outer region closes.
+    """
+    page = doc[page_num]
+    content = page.read_contents().decode("latin-1")
+
+    do_pos = _find_do_position(content, img_index, img_name)
+    if do_pos == -1:
+        raise ValueError(f"Could not locate image target draw token on page {page_num+1}")
+
+    pre = content[:do_pos]
+    post = content[do_pos:]
+
+    q_pos = -1
+    for qm in re.finditer(r'(?:^|[\n ])q(?:[\n ]|$)', pre):
+        q_pos = qm.start()
+    q_close = re.search(r'(?:^|[\n ])Q(?:[\n ]|$)', post)
+
+    if q_pos < 0 or not q_close:
+        raise ValueError(f"Could not locate a clean q...Q wrap around the image on page {page_num+1}")
+
+    close_pos = do_pos + q_close.end()
+    q_char_pos = q_pos + 1 if content[q_pos] in (' ', '\n') else q_pos
+
+    needs_split = False
+    outer_tag = None
+    outer_mcid = None
+
+    enclosing = _find_enclosing_open_bdc(content, do_pos)
+    if enclosing is not None:
+        emc_start, _ = _find_matching_emc(content, enclosing['open_end'])
+        outer_span = content[enclosing['open_end']:emc_start]
+        # "Tight" = the outer region is basically just our image (one Do,
+        # no text). More than that (another image, a stroke, etc.) means
+        # this region has nothing structurally to do with just our image,
+        # so we split rather than bury our Figure inside it.
+        if outer_span.count(" Do") > 1 or "BT" in outer_span:
+            needs_split = True
+            outer_tag = enclosing['tag']
+            outer_mcid = enclosing['mcid']
+
+    print(
+        f"🦜 [Polly Core] analyze_figure_insertion: page={page_num} imgIdx={img_index} "
+        f"needs_split={needs_split} outer_tag={outer_tag} outer_mcid={outer_mcid}"
+    )
+
+    return {
+        'content': content,
+        'q_char_pos': q_char_pos,
+        'close_pos': close_pos,
+        'needs_split': needs_split,
+        'outer_tag': outer_tag,
+        'outer_mcid': outer_mcid,
+    }
+
+
+def rewrite_content_stream_for_new_figure(
+    doc: fitz.Document, page_num: int, analysis: dict, fig_mcid: int, continuation_mcid: int = None
+) -> bool:
+    """
+    Performs the actual content-stream edit described by analyze_figure_insertion().
+    If needs_split is False: tight-wraps just the image in a new Figure BDC/EMC.
+    If needs_split is True: closes the pre-existing outer region early, inserts
+    the tightly-wrapped Figure as a sibling, then reopens the outer region
+    (same tag, new continuation_mcid) so its remaining content — and its own
+    original closing EMC, untouched — keeps working exactly as before.
+    """
+    content = analysis['content']
+    q_char_pos = analysis['q_char_pos']
+    close_pos = analysis['close_pos']
+    img_block = content[q_char_pos:close_pos].strip()
+
+    if analysis['needs_split']:
+        outer_tag = analysis['outer_tag']
+        print(
+            f"🦜 [Polly Core] Splitting enclosing /{outer_tag} MCID {analysis['outer_mcid']} "
+            f"around new Figure MCID {fig_mcid}; continuation MCID {continuation_mcid}"
+        )
+        new_content = (
+            content[:q_char_pos]
+            + "EMC\n"
+            + f"/Figure << /MCID {fig_mcid} >>BDC\n{img_block}\nEMC\n"
+            + f"/{outer_tag} << /MCID {continuation_mcid} >>BDC\n"
+            + content[close_pos:]
+        )
+    else:
+        new_content = (
+            content[:q_char_pos]
+            + f"/Figure << /MCID {fig_mcid} >>BDC\n{img_block}\nEMC\n"
+            + content[close_pos:]
+        )
+
+    contents_xref = _get_contents_xref(doc, page_num)
+    doc.update_stream(contents_xref, new_content.encode("latin-1"), compress=False)
+    return True
+
+
+def _extend_struct_elem_k(doc: fitz.Document, struct_xref: int, extra_mcid: int) -> None:
+    """
+    Extend a struct element's /K from a bare integer (a single MCID) into
+    an array covering both the original MCID and a new one. Used when we
+    split a pre-existing marked-content region to make room for a newly
+    inserted sibling Figure in the middle of it — the original struct
+    element's content is now split across two ranges on the same page,
+    which /K as an array of integers is explicitly designed to represent.
+    """
+    obj = doc.xref_object(struct_xref)
+    k_arr_m = re.search(r'/K\s*\[([^\]]*)\]', obj)
+    if k_arr_m:
+        updated = re.sub(
+            r'(/K\s*\[[^\]]*)\]',
+            lambda m: m.group(1) + f' {extra_mcid}]',
+            obj,
+        )
+    else:
+        k_int_m = re.search(r'/K\s+(\d+)\b', obj)
+        if not k_int_m:
+            raise ValueError(f"Could not find /K in struct element xref={struct_xref}")
+        orig_mcid = k_int_m.group(1)
+        updated = re.sub(r'/K\s+\d+\b', f'/K [ {orig_mcid} {extra_mcid} ]', obj)
+    doc.update_object(struct_xref, updated)
+
+def _create_continuation_struct_element(
+    doc: fitz.Document, page_xref: int, mcid: int, doc_struct_xref: int, source_xref: int
+) -> int:
+    """
+    Creates a brand-new struct element that continues a split marked-content
+    region as a true SIBLING of the original — not merged into it. This
+    matters: a single element with a multi-entry /K (e.g. [12, 14]) gets
+    read as one atomic, uninterrupted unit by some readers regardless of
+    what's been inserted into the content stream between those MCIDs. Two
+    separate elements, correctly ordered in Document's /K, actually get
+    interrupted by whatever sits between them in that array — which is
+    what we need for our new Figure to be heard in the right spot.
+
+    Copies the original element's /S role (e.g. /Figure) but deliberately
+    does NOT copy /Alt — the alt text belongs on our new Figure, not on
+    this leftover continuation of the pre-existing container.
+    """
+    source_obj = doc.xref_object(source_xref)
+    s_m = re.search(r'/S\s+(/\w+)', source_obj)
+    role = s_m.group(1) if s_m else '/Figure'
+
+    cont_xref = doc.get_new_xref()
+    struct_obj = (
+        f"<</Type /StructElem "
+        f"/S {role} "
+        f"/K {mcid} "
+        f"/P {doc_struct_xref} 0 R "
+        f"/Pg {page_xref} 0 R >>"
+    )
+    doc.update_object(cont_xref, struct_obj)
+    return cont_xref
+
+
+def _insert_siblings_after(doc: fitz.Document, after_xref: int, new_xrefs: list) -> None:
+    """
+    Insert new_xrefs into Document's /K array immediately after a SPECIFIC
+    existing element's own entry — not "at the end of this page's block"
+    like append_to_document_struct_k does. Needed for split-region
+    insertion, where reading order must literally interleave: [original
+    element] -> [our new Figure] -> [continuation element] -> whatever
+    came after the original before.
+    """
+    target_xref = _get_document_struct_xref(doc)
+    target_obj = doc.xref_object(target_xref)
+
+    k_match = re.search(r'/K\s*\[([^\]]+)\]', target_obj, re.DOTALL)
+    if not k_match:
+        raise ValueError("Could not find /K array in struct element")
+
+    entries = re.findall(r'\d+\s+0\s+R', k_match.group(1))
+    after_ref = f"{after_xref} 0 R"
+    try:
+        idx = entries.index(after_ref)
+    except ValueError:
+        raise ValueError(f"Could not find xref {after_xref} in Document /K to insert after")
+
+    for offset, nx in enumerate(new_xrefs):
+        entries.insert(idx + 1 + offset, f"{nx} 0 R")
+
+    entries_str = '\n      '.join(entries)
+    updated = re.sub(
+        r'(/K\s*\[)[^\]]+(\])',
+        lambda m: m.group(1) + '\n      ' + entries_str + ' ' + m.group(2),
+        target_obj,
+        flags=re.DOTALL
+    )
+    doc.update_object(target_xref, updated)
 
 def inject_alt_tagged(doc: fitz.Document, page_num: int, img_index: int, alt_text: str, img_name: str = "") -> str:
     """
     Full tagged-PDF remediation pipeline for one image.
-    Automatically handles both page-local (Acrobat) and global (InDesign) MCID systems.
+    Fast path: if a Figure struct element already covers this image, just
+    update its /Alt — avoids creating a redundant, nested duplicate Figure
+    around the same content.
+    Full path: rewrite content stream + wire a brand-new struct element,
+    handling both page-local (Acrobat) and global (InDesign) MCID systems.
     """
-    # Diagnostic: check content stream for Figure BDC markers
-    content = doc[page_num].read_contents().decode("latin-1", errors="ignore")
-    figure_bdcs = re.findall(r'/Figure\s*<<[^>]*/MCID\s+(\d+)[^>]*>>\s*BDC', content)
-    print(f"🦜 [Polly Core] inject_alt_tagged: page={page_num} imgIdx={img_index} figure_bdcs_in_stream={figure_bdcs}")
-    mcid = get_struct_tree_next_key(doc)
+    safe_alt = alt_text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    existing_xref = _find_existing_figure_for_image(doc, page_num, img_index)
+    if existing_xref != -1:
+        obj = doc.xref_object(existing_xref)
+        if "/Alt" in obj:
+            updated = re.sub(r"/Alt\s*\([^)]*\)", f"/Alt ({safe_alt}\\000)", obj)
+        else:
+            updated = obj.rstrip().rstrip(">").rstrip() + f"\n  /Alt ({safe_alt}\\000)\n>>"
+        doc.update_object(existing_xref, updated)
+        print(f"🦜 [Polly Core] Fast path: updated existing Figure xref={existing_xref}")
+        return (
+            f"Tagged (fast path): page {page_num+1}, imgIdx {img_index} "
+            f"-> existing Figure xref {existing_xref}"
+        )
+
     page_xref = doc[page_num].xref
 
     if _uses_page_local_mcids(doc, page_num):
         # PAGE-LOCAL path: MCID = slot index in the page's StructParents array
-        arr_xref = _get_page_struct_parents_array_xref(doc, page_num)
-        mcid = _get_next_free_mcid_in_page_array(doc, arr_xref)
+        analysis = analyze_figure_insertion(doc, page_num, img_index, img_name)
+        fig_mcid = _get_next_free_mcid_in_page_array(doc, page_num)
 
-        rewrite_content_stream_by_name_or_index(doc, page_num, img_index, img_name, mcid)
-        fig_xref = create_figure_struct_element(doc, page_xref, mcid, alt_text, page_num, img_index)
-        append_to_document_struct_k(doc, fig_xref, page_xref)
-        _insert_struct_elem_into_page_array(doc, arr_xref, mcid, fig_xref)
+        continuation_mcid = None
+        if analysis['needs_split']:
+            # Reserve fig_mcid's slot mentally, then find the NEXT free
+            # null slot for the outer region's continuation — can't just
+            # call _get_next_free_mcid_in_page_array() again since fig_mcid
+            # hasn't actually been written yet at this point.
+            entries, _, _ = _get_page_local_slot_entries(doc, page_num)
+            probe = entries.copy()
+            if fig_mcid < len(probe):
+                probe[fig_mcid] = 'reserved'
+            else:
+                probe.append('reserved')
+            continuation_mcid = next((i for i, s in enumerate(probe) if s == 'null'), len(probe))
+
+        rewrite_content_stream_for_new_figure(doc, page_num, analysis, fig_mcid, continuation_mcid)
+        fig_xref = create_figure_struct_element(doc, page_xref, fig_mcid, alt_text, page_num, img_index)
+        _insert_struct_elem_into_page_array(doc, page_num, fig_mcid, fig_xref)
+
+        split_note = ""
+        if analysis['needs_split']:
+            # Find the ORIGINAL element being split (still holds only its
+            # first MCID at this point — we haven't touched it)
+            outer_entries, _, _ = _get_page_local_slot_entries(doc, page_num)
+            outer_xref = int(outer_entries[analysis['outer_mcid']].split()[0])
+
+            doc_struct_xref = _get_document_struct_xref(doc)
+            cont_xref = _create_continuation_struct_element(
+                doc, page_xref, continuation_mcid, doc_struct_xref, outer_xref
+            )
+
+            # Insert BOTH new elements right after the original's own
+            # position in Document /K — NOT at the end of the page block —
+            # so reading order truly interleaves: original -> our Figure ->
+            # continuation -> rest of page.
+            _insert_siblings_after(doc, outer_xref, [fig_xref, cont_xref])
+            _insert_struct_elem_into_page_array(doc, page_num, continuation_mcid, cont_xref)
+
+            split_note = (
+                f", split enclosing /{analysis['outer_tag']} MCID "
+                f"{analysis['outer_mcid']}+{continuation_mcid} "
+                f"(original xref {outer_xref}, continuation xref {cont_xref})"
+            )
+        else:
+            append_to_document_struct_k(doc, fig_xref, page_xref)
         # No ParentTreeNextKey to update in page-local mode
 
         return (
             f"Tagged (page-local): page {page_num+1}, imgIdx {img_index} "
-            f"-> MCID {mcid} (slot in StructParents array), struct xref {fig_xref}"
+            f"-> MCID {fig_mcid} (slot in StructParents array), struct xref {fig_xref}"
+            + split_note
         )
     else:
         # GLOBAL path: MCID = ParentTreeNextKey, added as new top-level Nums entry
-        mcid = get_struct_tree_next_key(doc)
+        analysis = analyze_figure_insertion(doc, page_num, img_index, img_name)
+        fig_mcid = get_struct_tree_next_key(doc)
+        continuation_mcid = fig_mcid + 1 if analysis['needs_split'] else None
 
-    rewrite_content_stream_by_name_or_index(doc, page_num, img_index, img_name, mcid)
-    fig_xref = create_figure_struct_element(doc, page_xref, mcid, alt_text, page_num, img_index)
-    append_to_document_struct_k(doc, fig_xref)
-    update_parent_tree(doc, mcid, fig_xref)
-    increment_parent_tree_next_key(doc, mcid)
+        rewrite_content_stream_for_new_figure(doc, page_num, analysis, fig_mcid, continuation_mcid)
+        fig_xref = create_figure_struct_element(doc, page_xref, fig_mcid, alt_text, page_num, img_index)
+        update_parent_tree(doc, fig_mcid, fig_xref)
 
-    return (
-        f"Tagged (global): page {page_num+1}, imgIdx {img_index} "
-        f"-> MCID {mcid}, struct xref {fig_xref}"
-    )
+        max_mcid_used = fig_mcid
+        split_note = ""
+        if analysis['needs_split']:
+            pt_xref = _get_parent_tree_xref(doc)
+            pt_obj = doc.xref_object(pt_xref)
+            outer_ref_m = re.search(rf'\b{analysis["outer_mcid"]}\s+(\d+)\s+0\s+R', pt_obj)
+            if outer_ref_m:
+                outer_xref = int(outer_ref_m.group(1))
+                doc_struct_xref = _get_document_struct_xref(doc)
+                cont_xref = _create_continuation_struct_element(
+                    doc, page_xref, continuation_mcid, doc_struct_xref, outer_xref
+                )
+                _insert_siblings_after(doc, outer_xref, [fig_xref, cont_xref])
+                update_parent_tree(doc, continuation_mcid, cont_xref)
+                split_note = (
+                    f", split enclosing /{analysis['outer_tag']} MCID "
+                    f"{analysis['outer_mcid']}+{continuation_mcid} "
+                    f"(original xref {outer_xref}, continuation xref {cont_xref})"
+                )
+                max_mcid_used = continuation_mcid
+            else:
+                append_to_document_struct_k(doc, fig_xref)
+        else:
+            append_to_document_struct_k(doc, fig_xref)
+
+        increment_parent_tree_next_key(doc, max_mcid_used)
+
+        return (
+            f"Tagged (global): page {page_num+1}, imgIdx {img_index} "
+            f"-> MCID {fig_mcid}, struct xref {fig_xref}"
+            + split_note
+        )
 
 def _get_image_resource_name(doc: fitz.Document, page_num: int, img_xref: int) -> str:
     """
@@ -918,7 +1342,7 @@ def mark_image_as_artifact(doc: fitz.Document, page_num: int, img_index: int, im
     """
     Converts an image into a Decorative Artifact:
     1. Strips any existing /Alt attributes from structure tree elements or image XObjects.
-    2. Wraps the image draw command in an /Artifact BDC ... EMC block in the content stream.
+    2. Surgically wraps ONLY the image draw command in a valid /Artifact BMC ... EMC block.
     """
     page = doc[page_num]
     page_xref = page.xref
@@ -947,7 +1371,7 @@ def mark_image_as_artifact(doc: fitz.Document, page_num: int, img_index: int, im
     except Exception:
         pass
 
-    # 3. Rewrite content stream to wrap or convert the drawing command to /Artifact BDC
+    # 3. Surgical Content Stream Rewrite: Wrap ONLY the image draw sequence in /Artifact BMC ... EMC
     content = page.read_contents().decode("latin-1")
     clean_name = img_name.strip()
     if clean_name and not clean_name.startswith("/"):
@@ -963,46 +1387,47 @@ def mark_image_as_artifact(doc: fitz.Document, page_num: int, img_index: int, im
         do_matches = list(re.finditer(r'/\w+\s+Do', content))
         if img_index < len(do_matches):
             do_pos = do_matches[img_index].start()
+        else:
+            do_matches_fallback = list(re.finditer(r'/Im\d+\s+Do', content))
+            if img_index < len(do_matches_fallback):
+                do_pos = do_matches_fallback[img_index].start()
 
     if do_pos == -1:
         raise ValueError(f"Could not locate image target draw token on page {page_num+1}")
 
     pre = content[:do_pos]
-    bdc_match = None
-    for m in re.finditer(r'/(Artifact|Figure|P|Span)\s*(<<[^>]*>>)?\s*BDC', pre):
-        bdc_match = m
+    post = content[do_pos:]
 
-    if bdc_match:
-        # Replace existing figure BDC header with /Artifact BDC
-        block_start = bdc_match.start()
-        post = content[do_pos:]
-        emc_m = re.search(r'\bEMC\b', post)
-        if emc_m:
-            close_pos = do_pos + emc_m.end()
-            inner = content[block_start:close_pos]
-            new_inner = re.sub(r'/(Figure|P|Span|Artifact)\s*(<<[^>]*>>)?\s*BDC', '/Artifact BDC', inner, count=1)
-            new_content = content[:block_start] + new_inner + content[close_pos:]
-        else:
-            new_content = content[:do_pos] + "\n/Artifact BDC\n" + content[do_pos:]
-    else:
-        # Wrap the q...Q block or Do command line in /Artifact BDC ... EMC
-        q_pos = -1
-        for qm in re.finditer(r'(?:^|\n| )q(?:\n| )', pre):
-            q_pos = qm.start()
+    # Find immediate q before do_pos
+    q_pos = -1
+    for qm in re.finditer(r'(?:^|[\n ])q(?:[\n ]|$)', pre):
+        q_pos = qm.start()
 
-        if q_pos >= 0:
+    # Find matching Q after do_pos
+    q_close = re.search(r'(?:^|[\n ])Q(?:[\n ]|$)', post)
+
+    if q_pos >= 0 and q_close:
+        close_pos = do_pos + q_close.end()
+        block_content = content[q_pos:close_pos]
+        # Ensure block contains ONLY this single image draw sequence
+        if block_content.count(" Do") == 1 and "BT" not in block_content:
             q_char_pos = q_pos + 1 if content[q_pos] in (' ', '\n') else q_pos
-            post = content[do_pos:]
-            q_close = re.search(r'[\n ]Q[\n ]|[\n ]Q$', post) or re.search(r'Q', post)
-            if q_close:
-                close_pos = do_pos + q_close.end()
-                img_block = content[q_char_pos:close_pos]
-                new_block = f"\n/Artifact BDC\n{img_block.strip()}\nEMC\n"
-                new_content = content[:q_char_pos] + new_block + content[close_pos:]
-            else:
-                new_content = content[:do_pos] + "\n/Artifact BDC\n" + content[do_pos:]
-        else:
-            new_content = content[:do_pos] + "\n/Artifact BDC\n" + content[do_pos:]
+            img_block = content[q_char_pos:close_pos]
+            new_block = f"\n/Artifact BMC\n{img_block.strip()}\nEMC\n"
+            new_content = content[:q_char_pos] + new_block + content[close_pos:]
+            contents_xref = _get_contents_xref(doc, page_num)
+            doc.update_stream(contents_xref, new_content.encode("latin-1"), compress=False)
+            return f"Decorative Artifact: page {page_num+1}, imgIdx {img_index}"
+
+    # Fallback: wrap just the Do line itself
+    end_line_match = re.search(r'[\n]|Q', post)
+    end_line_pos = do_pos + (end_line_match.end() if end_line_match else len(post))
+    target_draw_cmd = content[do_pos:end_line_pos].strip()
+    new_content = (
+        content[:do_pos]
+        + f"\n/Artifact BMC\n{target_draw_cmd}\nEMC\n"
+        + content[end_line_pos:]
+    )
 
     contents_xref = _get_contents_xref(doc, page_num)
     doc.update_stream(contents_xref, new_content.encode("latin-1"), compress=False)
