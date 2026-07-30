@@ -280,21 +280,151 @@ def rewrite_content_stream_by_name_or_index(
     return True
 
 
+def _get_block_position(block_text: str) -> float:
+    """
+    Extracts a real y-position for a BT...ET block from its own Tm (set
+    text matrix) operator — "a b c d e f Tm" — where f is the y-coordinate.
+    Falls back to the older, less precise Td/TD (relative move) operators
+    if no Tm is present, and to a large sentinel value (sorts last) if
+    neither is found, so a block we can't place doesn't silently vanish —
+    it just ends up at the end, visibly out of place, rather than lost.
+    """
+    tm_matches = list(re.finditer(
+        r'([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+Tm\b',
+        block_text
+    ))
+    if tm_matches:
+        try:
+            return float(tm_matches[0].group(6))
+        except ValueError:
+            pass
+
+    td_match = re.search(r'([\-\d.]+)\s+([\-\d.]+)\s+Td\b', block_text)
+    if td_match:
+        try:
+            return float(td_match.group(2))
+        except ValueError:
+            pass
+
+    return -999999.0  # unknown position — sorts to the end, stays visible rather than silently dropped
+
+
+def _get_pymupdf_paragraph_blocks(doc: fitz.Document, page_num: int) -> list:
+    """
+    Returns PyMuPDF's own text-block segmentation for this page, as a list
+    of (y0, y1) ranges in top-down coordinates. PyMuPDF's block detection
+    uses font, spacing, and alignment signals — considerably better at
+    recognizing real paragraph and list-item boundaries than a simple
+    line-gap heuristic — so using it as the source of truth here is what
+    lets our tagged paragraphing match the original document's actual
+    paragraphing, rather than us re-guessing it from raw coordinates.
+    """
+    page = doc[page_num]
+    raw = page.get_text("dict")
+    blocks = []
+    for b in raw.get("blocks", []):
+        if b.get("type") != 0:
+            continue
+        x0, y0, x1, y1 = b["bbox"]
+        blocks.append((y0, y1))
+    return blocks
+
+
+def _assign_paragraph_block(y0: float, para_blocks: list, tolerance: float = 3.0) -> int:
+    """
+    Finds which PyMuPDF paragraph block (by index) a content-stream
+    fragment's y0 falls within, with a small tolerance for baseline vs.
+    bbox-edge rounding differences. Returns -1 if no block contains it —
+    treated as its own isolated group rather than silently merged into a
+    neighbor (this is what correctly keeps footers, page numbers, etc.
+    from bleeding into body paragraphs).
+    """
+    for i, (by0, by1) in enumerate(para_blocks):
+        if (by0 - tolerance) <= y0 <= (by1 + tolerance):
+            return i
+    return -1
+
+
+def _group_blocks_into_paragraphs(blocks: list, para_blocks: list) -> list:
+    """
+    Groups content-stream BT...ET fragments into paragraph-level wraps
+    using PyMuPDF's OWN text-block segmentation (para_blocks) to decide
+    boundaries, instead of a hand-rolled line-spacing heuristic. Fragments
+    are walked in STREAM order; a new group starts whenever the current
+    fragment belongs to a different PyMuPDF block than the previous one
+    (or either has no matching block at all).
+    """
+    if not blocks:
+        return []
+
+    groups = []
+    current = {"start": blocks[0]["start"], "end": blocks[0]["end"], "y0": blocks[0]["y0"]}
+    prev_para_id = _assign_paragraph_block(blocks[0]["y0"], para_blocks)
+
+    for b in blocks[1:]:
+        para_id = _assign_paragraph_block(b["y0"], para_blocks)
+        same_paragraph = (para_id != -1) and (para_id == prev_para_id)
+
+        if same_paragraph:
+            current["end"] = b["end"]
+        else:
+            groups.append(current)
+            current = {"start": b["start"], "end": b["end"], "y0": b["y0"]}
+
+        prev_para_id = para_id
+
+    groups.append(current)
+    return groups
+
+
+def _get_block_position(block_text: str) -> float:
+    """
+    Extracts a real y-position for a BT...ET block from its own Tm (set
+    text matrix) operator — "a b c d e f Tm" — where f is the y-coordinate.
+    Falls back to the older, less precise Td/TD (relative move) operators
+    if no Tm is present, and to a large sentinel value (sorts last) if
+    neither is found, so a block we can't place doesn't silently vanish —
+    it just ends up at the end, visibly out of place, rather than lost.
+    """
+    tm_matches = list(re.finditer(
+        r'([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+Tm\b',
+        block_text
+    ))
+    if tm_matches:
+        try:
+            return float(tm_matches[0].group(6))
+        except ValueError:
+            pass
+
+    td_match = re.search(r'([\-\d.]+)\s+([\-\d.]+)\s+Td\b', block_text)
+    if td_match:
+        try:
+            return float(td_match.group(2))
+        except ValueError:
+            pass
+
+    return -999999.0
+
+
 def rewrite_content_stream_for_text_blocks(
     doc: fitz.Document, page_num: int, first_mcid: int
-) -> list[int]:
+) -> list:
     """
-    Wraps every top-level BT...ET text object in the page's content stream
-    in its own /P << /MCID n >> BDC ... EMC pair, in the order the blocks
-    appear in the stream. Assigns sequential MCIDs starting at first_mcid.
+    Wraps runs of text on the page in /P << /MCID n >> BDC ... EMC pairs —
+    one per PARAGRAPH, not one per raw BT...ET object. Quartz-style PDF
+    generators fragment a single visual line into several BT...ET objects
+    (per glyph run or kerning break), and lines within one paragraph are
+    each their own BT...ET too — wrapping every one individually made a
+    screen reader announce each tiny fragment as its own paragraph. This
+    groups them back together using _group_blocks_into_paragraphs() before
+    wrapping, so the resulting /P elements read like real paragraphs.
 
-    NOTE: this assumes BT...ET blocks appear in the content stream in the
-    same order get_text_blocks_in_order() reports visually — true for the
-    single-column documents we've tested so far. Multi-column layouts may
-    need smarter matching later (tracked as a follow-up).
+    Returns a list of {"mcid", "y0"} dicts, in STREAM order, one per
+    paragraph group (not one per raw BT...ET object).
     """
     page = doc[page_num]
     content = page.read_contents().decode("latin-1")
+    page_height = page.rect.height
 
     bt_et_matches = list(re.finditer(r'BT.*?ET', content, re.DOTALL))
     print(
@@ -305,22 +435,37 @@ def rewrite_content_stream_for_text_blocks(
     if not bt_et_matches:
         return []
 
-    assigned_mcids = []
+    blocks = []
+    for m in bt_et_matches:
+        raw_y = _get_block_position(m.group(0))
+        y0 = page_height - raw_y if raw_y != -999999.0 else raw_y
+        blocks.append({"start": m.start(), "end": m.end(), "y0": y0})
+
+    para_blocks = _get_pymupdf_paragraph_blocks(doc, page_num)
+    groups = _group_blocks_into_paragraphs(blocks, para_blocks)
+    print(
+        f"🦜 [Polly Core] paragraph grouping: {len(bt_et_matches)} BT..ET block(s), "
+        f"{len(para_blocks)} PyMuPDF text block(s) -> {len(groups)} paragraph group(s)"
+    )
+
+    assigned = []
     new_content = ""
     cursor = 0
-    for i, m in enumerate(bt_et_matches):
+    for i, g in enumerate(groups):
         mcid = first_mcid + i
-        assigned_mcids.append(mcid)
-        new_content += content[cursor:m.start()]
-        new_content += f"/P << /MCID {mcid} >>BDC\n{m.group(0)}\nEMC\n"
-        cursor = m.end()
+        assigned.append({"mcid": mcid, "y0": g["y0"]})
+        new_content += content[cursor:g["start"]]
+        new_content += f"/P << /MCID {mcid} >>BDC\n{content[g['start']:g['end']]}\nEMC\n"
+        cursor = g["end"]
     new_content += content[cursor:]
 
     contents_xref = _get_contents_xref(doc, page_num)
     print(f"🦜 [Polly Core] text block content rewrite: new length={len(new_content)}")
+    for a in assigned:
+        print(f"🦜 [Polly Core]   mcid={a['mcid']} y0={a['y0']:.1f}")
     doc.update_stream(contents_xref, new_content.encode("latin-1"), compress=False)
 
-    return assigned_mcids
+    return assigned
 
 
 def create_figure_struct_element(
@@ -1227,14 +1372,28 @@ def _ensure_struct_tree(doc: fitz.Document) -> None:
     )
     doc.update_object(cat_xref, updated_cat)
 
-    # 6. StructParents on pages
-    print(f"🦜 [Polly Core] scaffold step 6: adding /StructParents to pages")
+    # 6. StructParents on pages — ALWAYS normalize to the correct sequential
+    # index, even if a page already has one. We already know from is_tagged()
+    # that this document has no real struct tree, so any pre-existing
+    # /StructParents is orphaned cruft from whatever tool touched this PDF
+    # before — and if left alone, it can collide with slot indices our own
+    # ParentTree/Nums array actually uses (duplicate or out-of-range number
+    # tree keys), corrupting the tree the moment we try to wire into it.
+    print(f"🦜 [Polly Core] scaffold step 6: normalizing /StructParents on pages")
     for i in range(doc.page_count):
         page_obj = doc.xref_object(doc[i].xref)
-        if "/StructParents" not in page_obj:
+        if "/StructParents" in page_obj:
+            existing_m = re.search(r'/StructParents\s+(\d+)', page_obj)
+            if existing_m and int(existing_m.group(1)) != i:
+                print(
+                    f"🦜 [Polly Core]   page {i+1}: had stray /StructParents "
+                    f"{existing_m.group(1)}, correcting to {i}"
+                )
+            updated_page = re.sub(r'/StructParents\s+\d+', f'/StructParents {i}', page_obj)
+        else:
             updated_page = page_obj.rstrip().rstrip(">").rstrip()
             updated_page += f"\n  /StructParents {i}\n>>"
-            doc.update_object(doc[i].xref, updated_page)
+        doc.update_object(doc[i].xref, updated_page)
 
     print(f"🦜 [Polly Core] scaffold complete")
 
@@ -1273,9 +1432,6 @@ def inject_alt_untagged(doc: fitz.Document, page_num: int, img_index: int, alt_t
         img_bbox = (0, 0, 612, 792)
     img_y0 = img_bbox[1]
 
-    # Inventory the text blocks on this page in naive reading order
-    text_blocks = get_text_blocks_in_order(doc, page_num)
-
     # Assign an MCID + wrap the image draw command in a Figure BDC/EMC
     img_mcid = get_struct_tree_next_key(doc)
     rewrite_content_stream_by_name_or_index(
@@ -1293,27 +1449,27 @@ def inject_alt_untagged(doc: fitz.Document, page_num: int, img_index: int, alt_t
     # increment_parent_tree_next_key() runs at the end of this function,
     # so a second call here would just return the same stale value and
     # collide with img_mcid.
+    #
+    # NOTE: we no longer cross-reference get_text_blocks_in_order() here.
+    # rewrite_content_stream_for_text_blocks() now returns each block's OWN
+    # y-position (pulled from its Tm operator), so every wrapped BT...ET
+    # region gets a struct element by construction — there's no separate
+    # line-count list to fall out of sync with, and no chance of a region
+    # getting tagged in the stream but silently orphaned from the tree.
     text_start_mcid = img_mcid + 1
-    text_mcids = rewrite_content_stream_for_text_blocks(doc, page_num, text_start_mcid)
-
-    if len(text_mcids) != len(text_blocks):
-        print(
-            f"🦜 [Polly Core] ⚠️ page {page_num+1}: line count ({len(text_blocks)}) "
-            f"!= BT..ET count ({len(text_mcids)}) — some tagged regions won't "
-            f"get a matching struct element"
-        )
+    text_blocks = rewrite_content_stream_for_text_blocks(doc, page_num, text_start_mcid)
 
     text_xrefs = [
-        create_text_struct_element(doc, page_xref, mcid, doc_struct_xref)
-        for mcid in text_mcids
+        create_text_struct_element(doc, page_xref, blk["mcid"], doc_struct_xref)
+        for blk in text_blocks
     ]
 
     print(f"🦜 [Polly Core] page {page_num+1}: img_y0={img_y0:.1f}")
 
     # Combine image + text into one reading-order sequence, sorted by y0
     items = [{"y0": img_y0, "mcid": img_mcid, "xref": fig_xref}]
-    for blk, mcid, xref in zip(text_blocks, text_mcids, text_xrefs):
-        items.append({"y0": blk["bbox"][1], "mcid": mcid, "xref": xref})
+    for blk, xref in zip(text_blocks, text_xrefs):
+        items.append({"y0": blk["y0"], "mcid": blk["mcid"], "xref": xref})
     items.sort(key=lambda it: it["y0"])
 
     print(f"🦜 [Polly Core] page {page_num+1}: wiring {len(items)} struct element(s) in reading order:")
@@ -1330,7 +1486,7 @@ def inject_alt_untagged(doc: fitz.Document, page_num: int, img_index: int, alt_t
     return (
         f"Untagged+scaffold: page {page_num+1}, imgIdx {img_index}, "
         f"MCID {img_mcid}, struct xref {fig_xref}, "
-        f"+{len(text_mcids)} text block(s) tagged"
+        f"+{len(text_blocks)} text block(s) tagged"
     )
 
 
@@ -1621,6 +1777,64 @@ def find_alt_in_struct_tree(doc: fitz.Document, page_num: int, img_index: int) -
 
     return ""
     
+def get_reading_units_for_page(doc: fitz.Document, page_num: int) -> list:
+    """
+    Builds ONE ordered list of "reading units" for a page — text lines AND
+    images together, sorted by vertical position — so the reading order we'd
+    use when scaffolding a struct tree from scratch (untagged PDFs) becomes
+    an explicit, inspectable data structure rather than an implicit side
+    effect buried inside inject_alt_untagged's sort call.
+
+    Each unit gets a stable unit_id (e.g. "p4-u7") so a future frontend
+    order-editing UI can reference specific units, and eventually submit a
+    corrected order back via /remediate instead of relying on this default
+    y0-based guess.
+
+    NOTE: this only reflects OUR OWN best-guess ordering for untagged PDFs.
+    For already-tagged PDFs, real reading order comes from the existing
+    struct tree (Document /K order), not from this function — a separate
+    concern we're deliberately not conflating with this one.
+    """
+    page = doc[page_num]
+    text_lines = get_text_blocks_in_order(doc, page_num)
+
+    try:
+        img_infos = page.get_image_info(hashes=False)
+        raster_infos = [i for i in img_infos if i.get('width', 0) > 1]
+    except Exception:
+        raster_infos = []
+
+    units = []
+    for line in text_lines:
+        units.append({
+            "type": "text",
+            "y0": line["bbox"][1],
+            "preview": line["text"].strip().replace("\n", " ")[:60],
+        })
+    for img_idx, info in enumerate(raster_infos):
+        bbox = info.get("bbox", (0, 0, 0, 0))
+        units.append({
+            "type": "image",
+            "y0": bbox[1],
+            "img_index": img_idx,
+        })
+
+    # Single combined sort — this is the same heuristic (and the same
+    # limitation: an inline image whose bbox top lands mid-paragraph can
+    # still land mid-paragraph here) currently living inside
+    # inject_alt_untagged. Surfacing it here doesn't fix that on its own,
+    # but it's the necessary first step toward letting a person see and
+    # correct it.
+    units.sort(key=lambda u: u["y0"])
+
+    for i, u in enumerate(units):
+        u["unit_id"] = f"p{page_num}-u{i}"
+
+    print(f"🦜 [Polly Core] page {page_num+1}: {len(units)} reading unit(s) computed")
+
+    return units
+
+
 @app.route("/inspect", methods=["POST"])
 def inspect_pdf():
     """
@@ -1636,6 +1850,7 @@ def inspect_pdf():
         tagged = is_tagged(doc)
  
         pages = {}
+        reading_order = {}
         for page_num in range(doc.page_count):
             images = doc[page_num].get_images(full=True)
             raster = [img for img in images if img[2] > 1]
@@ -1651,8 +1866,14 @@ def inspect_pdf():
                     }
                     for i, img in enumerate(raster)
                 ]
+                # Only computed for pages with images for now — this is
+                # exactly where naive y0-sort ordering has been going wrong
+                # (an inline image landing mid-paragraph). Not yet wired to
+                # any UI; this just makes the data available.
+                reading_order[str(page_num)] = get_reading_units_for_page(doc, page_num)
+
         doc.close()
-        return jsonify({"tagged": tagged, "pages": pages})
+        return jsonify({"tagged": tagged, "pages": pages, "readingOrder": reading_order})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
